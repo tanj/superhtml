@@ -81,7 +81,7 @@ pub const Language = enum {
 
     /// Use to map file extensions to a Language, supports aliases.
     pub fn fromSliceResilient(s: []const u8) ?Language {
-        const Alias = enum { html, superhtml, shtml, xml };
+        const Alias = enum { html, superhtml, shtml, xml, htmlangular };
 
         const alias = std.meta.stringToEnum(Alias, s) orelse {
             return null;
@@ -89,7 +89,7 @@ pub const Language = enum {
 
         return switch (alias) {
             .superhtml, .shtml => .superhtml,
-            .html => .html,
+            .html, .htmlangular => .html,
             .xml => .xml,
         };
     }
