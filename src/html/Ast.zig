@@ -6,6 +6,7 @@ const Language = root.Language;
 const Span = root.Span;
 const Tokenizer = @import("Tokenizer.zig");
 
+const indent_string = "    ";
 const log = std.log.scoped(.@"html/ast");
 
 const TagNameMap = std.StaticStringMapWithEql(
@@ -562,7 +563,7 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                         log.debug("adding a newline", .{});
                         try w.writeAll("\n");
                         for (0..indentation) |_| {
-                            try w.writeAll("  ");
+                            try w.writeAll(indent_string);
                         }
                     }
                 }
@@ -598,7 +599,7 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                     if (open_was_vertical) {
                         try w.writeAll("\n");
                         for (0..indentation) |_| {
-                            try w.writeAll("  ");
+                            try w.writeAll(indent_string);
                         }
                     }
                 }
@@ -745,7 +746,7 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                                 if (vertical) {
                                     try w.print("\n", .{});
                                     for (0..indentation + extra) |_| {
-                                        try w.print("  ", .{});
+                                        try w.print(indent_string, .{});
                                     }
                                 } else {
                                     try w.print(" ", .{});
@@ -771,7 +772,7 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                     if (vertical) {
                         try w.print("\n", .{});
                         for (0..indentation + extra -| 1) |_| {
-                            try w.print("  ", .{});
+                            try w.print(indent_string, .{});
                         }
                     }
 
