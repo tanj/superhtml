@@ -1,10 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const folders = @import("known-folders");
+const folders = @import("known_folders");
 
 pub var log_file: ?std.fs.File = switch (builtin.target.os.tag) {
-    .linux, .macos => std.io.getStdErr(),
+    .linux, .macos => std.fs.File.stderr(),
     else => null,
 };
 
@@ -18,7 +18,7 @@ pub var log_file: ?std.fs.File = switch (builtin.target.os.tag) {
 
 pub fn logFn(
     comptime level: std.log.Level,
-    comptime scope: @Type(.EnumLiteral),
+    comptime scope: @Type(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -37,9 +37,11 @@ pub fn logFn(
     std.debug.lockStdErr();
     defer std.debug.unlockStdErr();
 
-    var buf_writer = std.io.bufferedWriter(l.writer());
-    buf_writer.writer().print(prefix ++ format ++ "\n", args) catch return;
-    buf_writer.flush() catch return;
+    var buf: [1024]u8 = undefined;
+    var fw = l.writer(&buf);
+    const w = &fw.interface;
+    w.print(prefix ++ format ++ "\n", args) catch return;
+    w.flush() catch return;
 }
 
 pub fn setup(gpa: std.mem.Allocator) void {

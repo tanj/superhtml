@@ -1,7 +1,7 @@
 const std = @import("std");
 const super = @import("superhtml");
 
-pub const std_options = .{ .log_level = .err };
+pub const std_options: std.Options = .{ .log_level = .err };
 
 /// This main function is meant to be used via black box fuzzers
 /// and/or to manually weed out test cases that are not valid anymore
@@ -20,7 +20,8 @@ pub fn main() !void {
     defer ast.deinit(gpa);
 
     if (ast.errors.len == 0) {
-        try ast.render(src, std.io.null_writer);
+        var dw: std.Io.Writer.Discarding = .init(&.{});
+        try ast.render(src, &dw.writer);
     }
 }
 
@@ -45,7 +46,8 @@ test "afl++ fuzz cases" {
         const ast = try super.html.Ast.init(std.testing.allocator, c, .html);
         defer ast.deinit(std.testing.allocator);
         if (ast.errors.len == 0) {
-            try ast.render(c, std.io.null_writer);
+            var dw: std.Io.Writer.Discarding = .init(&.{});
+            try ast.render(c, &dw.writer);
         }
         // ast.debug(c);
     }

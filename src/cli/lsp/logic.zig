@@ -3,7 +3,7 @@ const lsp = @import("lsp");
 const super = @import("superhtml");
 const lsp_namespace = @import("../lsp.zig");
 const Handler = lsp_namespace.Handler;
-const getRange = lsp_namespace.getRange;
+const getRange = Handler.getRange;
 const Document = @import("Document.zig");
 
 const log = std.log.scoped(.ziggy_lsp);
@@ -11,7 +11,7 @@ const log = std.log.scoped(.ziggy_lsp);
 pub fn loadFile(
     self: *Handler,
     arena: std.mem.Allocator,
-    new_text: [:0]const u8,
+    new_text: []const u8,
     uri: []const u8,
     language: super.Language,
 ) !void {
@@ -56,7 +56,7 @@ pub fn loadFile(
         }
         res.diagnostics = diags;
     } else {
-        if (doc.super) |super_ast| {
+        if (doc.super_ast) |super_ast| {
             const diags = try arena.alloc(
                 lsp.types.Diagnostic,
                 super_ast.errors.len,
@@ -73,10 +73,11 @@ pub fn loadFile(
         }
     }
 
-    const msg = try self.server.sendToClientNotification(
+    try self.transport.writeNotification(
+        self.gpa,
         "textDocument/publishDiagnostics",
+        lsp.types.PublishDiagnosticsParams,
         res,
+        .{ .emit_null_optional_fields = false },
     );
-
-    defer self.gpa.free(msg);
 }

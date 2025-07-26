@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const html = @import("html.zig");
 const HtmlNode = html.Ast.Node;
 const Span = @import("root.zig").Span;
+const Writer = std.Io.Writer;
 
 const log = std.log.scoped(.ast);
 
@@ -138,11 +139,12 @@ pub const Node = struct {
         ast: Ast,
     ) void {
         std.debug.print("\n\n-- DEBUG --\n", .{});
+        var stderr = std.fs.File.stderr().writer(&.{});
         node.debugInternal(
             src,
             html_ast,
             ast,
-            std.io.getStdErr().writer(),
+            &stderr.interface,
             0,
         ) catch unreachable;
     }
@@ -153,7 +155,7 @@ pub const Node = struct {
         src: []const u8,
         html_ast: html.Ast,
         ast: Ast,
-        w: anytype,
+        w: *Writer,
     ) void {
         node.debugInternal(src, html_ast, ast, w, 0) catch unreachable;
     }
@@ -170,11 +172,11 @@ pub const Node = struct {
         src: []const u8,
         html_ast: html.Ast,
         ast: Ast,
-        w: anytype,
+        w: *Writer,
         lvl: usize,
     ) !void {
         for (0..lvl) |_| try w.print("    ", .{});
-        try w.print("({s} {}", .{ @tagName(node.kind), node.depth });
+        try w.print("({t} {}", .{ node.kind, node.depth });
 
         if (node.hasId()) |id| {
             try w.print(" #{s}", .{id.value.?.span.slice(src)});
@@ -231,9 +233,10 @@ pub fn childrenCount(ast: Ast, node: Node) usize {
     return count;
 }
 
-pub fn deinit(ast: Ast, gpa: std.mem.Allocator) void {
-    @constCast(&ast).interface.deinit(gpa);
-    @constCast(&ast).blocks.deinit(gpa);
+pub fn deinit(ast: *const Ast, gpa: std.mem.Allocator) void {
+    var mut_ast = ast.*;
+    mut_ast.interface.deinit(gpa);
+    mut_ast.blocks.deinit(gpa);
     gpa.free(ast.nodes);
     gpa.free(ast.errors);
 }
@@ -995,7 +998,7 @@ pub fn printInterfaceAsHtml(
     ast: Ast,
     html_ast: html.Ast,
     path: ?[]const u8,
-    out: anytype,
+    out: *Writer,
 ) !void {
     if (path) |p| {
         try out.print("<extend template=\"{s}\">\n", .{p});
@@ -1029,14 +1032,19 @@ pub fn printInterfaceAsHtml(
     }
 }
 
-pub fn printErrors(ast: Ast, src: []const u8, path: ?[]const u8) void {
+pub fn printErrors(
+    ast: Ast,
+    src: []const u8,
+    path: ?[]const u8,
+    w: *Writer,
+) !void {
     for (ast.errors) |err| {
         const range = err.main_location.range(src);
-        std.debug.print("{s}:{}:{}: {s}\n", .{
+        try w.print("{s}:{}:{}: {t}\n", .{
             path orelse "<stdin>",
             range.start.row,
             range.start.col,
-            @tagName(err.kind),
+            err.kind,
         });
     }
 }
@@ -1053,15 +1061,7 @@ const Formatter = struct {
     html: html.Ast,
     path: ?[]const u8,
 
-    pub fn format(
-        f: Formatter,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        out_stream: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
+    pub fn format(f: Formatter, out_stream: *Writer) !void {
         try f.ast.printInterfaceAsHtml(f.html, f.path, out_stream);
     }
 };
@@ -1143,10 +1143,10 @@ test "siblings" {
     const tree = try Ast.init(std.testing.allocator, html_ast, case);
     defer tree.deinit(std.testing.allocator);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
 
-    tree.root().debugWriter(case, html_ast, tree, out.writer());
+    tree.root().debugWriter(case, html_ast, tree, &out.writer);
 
     const ex =
         \\(root 0
@@ -1155,7 +1155,7 @@ test "siblings" {
         \\)
         \\
     ;
-    try std.testing.expectEqualStrings(ex, out.items);
+    try std.testing.expectEqualStrings(ex, out.getWritten());
 }
 
 test "nesting" {
@@ -1177,10 +1177,10 @@ test "nesting" {
     const tree = try Ast.init(std.testing.allocator, html_ast, case);
     defer tree.deinit(std.testing.allocator);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
 
-    tree.root().debugWriter(case, html_ast, tree, out.writer());
+    tree.root().debugWriter(case, html_ast, tree, &out.writer);
 
     const ex =
         \\(root 0
@@ -1191,7 +1191,7 @@ test "nesting" {
         \\)
         \\
     ;
-    try std.testing.expectEqualStrings(ex, out.items);
+    try std.testing.expectEqualStrings(ex, out.getWritten());
 }
 
 test "deeper nesting" {
@@ -1213,10 +1213,10 @@ test "deeper nesting" {
     const tree = try Ast.init(std.testing.allocator, html_ast, case);
     defer tree.deinit(std.testing.allocator);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
 
-    tree.root().debugWriter(case, html_ast, tree, out.writer());
+    tree.root().debugWriter(case, html_ast, tree, &out.writer);
 
     const ex =
         \\(root 0
@@ -1227,7 +1227,7 @@ test "deeper nesting" {
         \\)
         \\
     ;
-    try std.testing.expectEqualStrings(ex, out.items);
+    try std.testing.expectEqualStrings(ex, out.getWritten());
 }
 
 test "complex example" {
@@ -1254,11 +1254,11 @@ test "complex example" {
     const tree = try Ast.init(std.testing.allocator, html_ast, case);
     defer tree.deinit(std.testing.allocator);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
 
     const r = tree.root();
-    r.debugWriter(case, html_ast, tree, out.writer());
+    r.debugWriter(case, html_ast, tree, &out.writer);
 
     const cex: usize = 3;
     try std.testing.expectEqual(cex, tree.childrenCount(tree.child(r).?));
@@ -1277,7 +1277,7 @@ test "complex example" {
         \\)
         \\
     ;
-    try std.testing.expectEqualStrings(ex, out.items);
+    try std.testing.expectEqualStrings(ex, out.getWritten());
 }
 
 test "if-else-loop errors" {
@@ -1329,11 +1329,11 @@ test "super" {
     const tree = try Ast.init(std.testing.allocator, html_ast, case);
     defer tree.deinit(std.testing.allocator);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
 
     const r = tree.root();
-    r.debugWriter(case, html_ast, tree, out.writer());
+    r.debugWriter(case, html_ast, tree, &out.writer);
 
     const ex =
         \\(root 0
@@ -1347,7 +1347,7 @@ test "super" {
         \\)
         \\
     ;
-    try std.testing.expectEqualStrings(ex, out.items);
+    try std.testing.expectEqualStrings(ex, out.getWritten());
 
     const cex: usize = 2;
     try std.testing.expectEqual(cex, tree.childrenCount(tree.child(r).?));

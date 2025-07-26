@@ -10,11 +10,35 @@ pub fn build(b: *std.Build) !void {
         "When building the SuperHTML CLI tool force a specific version, bypassing 'git describe'",
     )) |v| .{ .commit = v } else getVersion(b);
 
-    const scripty = b.dependency("scripty", .{});
+    const enable_tracy = b.option(bool, "tracy", "Enable Tracy profiling") orelse false;
+
+    const tracy = b.dependency("tracy", .{ .enable = enable_tracy });
+    const scripty = b.dependency("scripty", .{
+        .target = target,
+        .optimize = optimize,
+        .tracy = enable_tracy,
+    });
+
     const superhtml = b.addModule("superhtml", .{
         .root_source_file = b.path("src/root.zig"),
+        .target = target,
     });
     superhtml.addImport("scripty", scripty.module("scripty"));
+    superhtml.addImport("tracy", tracy.module("tracy"));
+
+    if (enable_tracy) {
+        if (target.result.os.tag == .windows) {
+            superhtml.linkSystemLibrary("dbghelp", .{});
+            superhtml.linkSystemLibrary("ws2_32", .{});
+        }
+
+        // superhtml.addObjectFile(b.path("libTracyClient.a"));
+        //
+        superhtml.linkSystemLibrary("TracyClient", .{});
+        superhtml.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/tracy/lib" });
+        superhtml.link_libc = true;
+        superhtml.link_libcpp = true;
+    }
 
     const options = b.addOptions();
     const verbose_logging = b.option(bool, "log", "Enable verbose logging also in release modes") orelse false;
@@ -24,13 +48,13 @@ pub fn build(b: *std.Build) !void {
     options.addOption([]const u8, "version", version.string());
     options.addOption(Version.Kind, "version_kind", version);
 
-    const folders = b.dependency("known-folders", .{});
-    const lsp = b.dependency("zig-lsp-kit", .{});
+    const folders = b.dependency("known_folders", .{});
+    const lsp = b.dependency("lsp_kit", .{});
 
-    setupTestStep(b, target, superhtml);
+    const check = setupCheckStep(b, target, optimize, options, superhtml, folders, lsp);
+    setupTestStep(b, target, superhtml, check);
     setupCliTool(b, target, optimize, options, superhtml, folders, lsp);
     setupWasmStep(b, optimize, options, superhtml, lsp);
-    setupCheckStep(b, target, optimize, options, superhtml, folders, lsp);
     if (version == .tag) {
         setupReleaseStep(b, options, superhtml, folders, lsp);
     }
@@ -52,49 +76,52 @@ fn setupCheckStep(
     superhtml: *std.Build.Module,
     folders: *std.Build.Dependency,
     lsp: *std.Build.Dependency,
-) void {
+) *std.Build.Step {
+    const check = b.step("check", "Check if the SuperHTML CLI compiles");
     const super_cli_check = b.addExecutable(.{
         .name = "superhtml",
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     super_cli_check.root_module.addImport("superhtml", superhtml);
     super_cli_check.root_module.addImport(
-        "known-folders",
+        "known_folders",
         folders.module("known-folders"),
     );
     super_cli_check.root_module.addImport("lsp", lsp.module("lsp"));
     super_cli_check.root_module.addOptions("build_options", options);
 
-    const check = b.step("check", "Check if the SuperHTML CLI compiles");
     check.dependOn(&super_cli_check.step);
+    return check;
 }
 fn setupTestStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     superhtml: *std.Build.Module,
+    check: *std.Build.Step,
 ) void {
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(check);
 
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = .Debug,
+        .root_module = superhtml,
         // .strip = true,
         // .filter = "if-else-loop",
     });
-
-    unit_tests.root_module.addImport("superhtml", superhtml);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
 
     const fuzz_tests = b.addTest(.{
-        .root_source_file = b.path("src/fuzz.zig"),
-        .target = target,
-        .optimize = .Debug,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
         // .strip = true,
         // .filter = "nesting",
     });
@@ -109,12 +136,14 @@ fn setupFuzzStep(
     target: std.Build.ResolvedTarget,
     superhtml: *std.Build.Module,
 ) void {
-    const afl = b.lazyImport(@This(), "zig-afl-kit") orelse return;
+    const afl = b.lazyImport(@This(), "afl_kit") orelse return;
     const afl_obj = b.addObject(.{
         .name = "superfuzz-afl",
-        .root_source_file = b.path("src/fuzz/afl.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz/afl.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
     });
 
     afl_obj.root_module.addImport("superhtml", superhtml);
@@ -125,15 +154,20 @@ fn setupFuzzStep(
         b,
         target,
         .ReleaseSafe,
+        null,
+        false,
         afl_obj,
-    );
+    ) orelse return;
     b.getInstallStep().dependOn(&b.addInstallFile(afl_fuzz, "superfuzz-afl").step);
+    // b.installArtifact(afl_fuzz);
 
     const super_fuzz = b.addExecutable(.{
         .name = "superfuzz",
-        .root_source_file = b.path("src/fuzz.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
     });
 
     super_fuzz.root_module.addImport("superhtml", superhtml);
@@ -141,9 +175,11 @@ fn setupFuzzStep(
 
     const supergen = b.addExecutable(.{
         .name = "supergen",
-        .root_source_file = b.path("src/fuzz/astgen.zig"),
-        .target = target,
-        .optimize = .Debug,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz/astgen.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
     });
 
     supergen.root_module.addImport("superhtml", superhtml);
@@ -161,15 +197,17 @@ fn setupCliTool(
 ) void {
     const super_cli = b.addExecutable(.{
         .name = "superhtml",
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
-        .single_threaded = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+        }),
     });
 
     super_cli.root_module.addImport("superhtml", superhtml);
     super_cli.root_module.addImport(
-        "known-folders",
+        "known_folders",
         folders.module("known-folders"),
     );
     super_cli.root_module.addImport("lsp", lsp.module("lsp"));
@@ -193,14 +231,16 @@ fn setupWasmStep(
     const wasm = b.step("wasm", "Generate a WASM build of the SuperHTML LSP for VSCode");
     const super_wasm_lsp = b.addExecutable(.{
         .name = "superhtml",
-        .root_source_file = b.path("src/wasm.zig"),
-        .target = b.resolveTargetQuery(.{
-            .cpu_arch = .wasm32,
-            .os_tag = .wasi,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .wasm32,
+                .os_tag = .wasi,
+            }),
+            .optimize = optimize,
+            .single_threaded = true,
+            .link_libc = false,
         }),
-        .optimize = optimize,
-        .single_threaded = true,
-        .link_libc = false,
     });
 
     super_wasm_lsp.root_module.addImport("superhtml", superhtml);
@@ -238,14 +278,16 @@ fn setupReleaseStep(
 
         const super_exe_release = b.addExecutable(.{
             .name = "superhtml",
-            .root_source_file = b.path("src/cli.zig"),
-            .target = release_target,
-            .optimize = .ReleaseFast,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cli.zig"),
+                .target = release_target,
+                .optimize = .ReleaseFast,
+            }),
         });
 
         super_exe_release.root_module.addImport("superhtml", superhtml);
         super_exe_release.root_module.addImport(
-            "known-folders",
+            "known_folders",
             folders.module("known-folders"),
         );
         super_exe_release.root_module.addImport("lsp", lsp.module("lsp"));
@@ -266,14 +308,16 @@ fn setupReleaseStep(
     {
         const super_wasm_lsp = b.addExecutable(.{
             .name = "superhtml",
-            .root_source_file = b.path("src/wasm.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .wasm32,
-                .os_tag = .wasi,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/wasm.zig"),
+                .target = b.resolveTargetQuery(.{
+                    .cpu_arch = .wasm32,
+                    .os_tag = .wasi,
+                }),
+                .optimize = .ReleaseSmall,
+                .single_threaded = true,
+                .link_libc = false,
             }),
-            .optimize = .ReleaseSmall,
-            .single_threaded = true,
-            .link_libc = false,
         });
 
         super_wasm_lsp.root_module.addImport("superhtml", superhtml);

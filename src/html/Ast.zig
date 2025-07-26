@@ -1,6 +1,8 @@
 const Ast = @This();
 
 const std = @import("std");
+const Writer = std.Io.Writer;
+const tracy = @import("tracy");
 const root = @import("../root.zig");
 const Language = root.Language;
 const Span = root.Span;
@@ -122,6 +124,9 @@ pub const Node = struct {
     };
 
     pub fn startTagIterator(n: Node, src: []const u8, language: Language) TagIterator {
+        const zone = tracy.trace(@src());
+        defer zone.end();
+
         var t: Tokenizer = .{
             .language = language,
             .idx = n.open.start,
@@ -165,10 +170,15 @@ pub fn cursor(ast: Ast, idx: u32) Cursor {
     return .{ .ast = ast, .idx = idx, .dir = .in };
 }
 
-pub fn printErrors(ast: Ast, src: []const u8, path: ?[]const u8) void {
+pub fn printErrors(
+    ast: Ast,
+    src: []const u8,
+    path: ?[]const u8,
+    w: *Writer,
+) !void {
     for (ast.errors) |err| {
         const range = err.main_location.range(src);
-        std.debug.print("{s}:{}:{}: {s}\n", .{
+        try w.print("{s}:{}:{}: {s}\n", .{
             path orelse "<stdin>",
             range.start.row,
             range.start.col,
@@ -529,7 +539,7 @@ pub fn init(
     };
 }
 
-pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
+pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
     std.debug.assert(ast.errors.len == 0);
 
     var indentation: u32 = 0;
@@ -539,12 +549,16 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
     // var last_open_was_vertical = false;
     var pre: u32 = 0;
     while (true) {
+        const zone_outer = tracy.trace(@src());
+        defer zone_outer.end();
         log.debug("looping, ind: {}, dir: {s}", .{
             indentation,
             @tagName(direction),
         });
         switch (direction) {
             .enter => {
+                const zone = tracy.trace(@src());
+                defer zone.end();
                 log.debug("rendering enter ({}): {s} {any}", .{
                     indentation,
                     "",
@@ -574,6 +588,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                 }
             },
             .exit => {
+                const zone = tracy.trace(@src());
+                defer zone.end();
                 std.debug.assert(current.kind != .text);
                 std.debug.assert(current.kind != .element_void);
                 std.debug.assert(current.kind != .element_self_closing);
@@ -609,6 +625,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
         switch (current.kind) {
             .root => switch (direction) {
                 .enter => {
+                    const zone = tracy.trace(@src());
+                    defer zone.end();
                     if (current.first_child_idx == 0) break;
                     current = ast.nodes[current.first_child_idx];
                 },
@@ -616,6 +634,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
             },
 
             .text => {
+                const zone = tracy.trace(@src());
+                defer zone.end();
                 std.debug.assert(direction == .enter);
 
                 const txt = current.open.slice(src);
@@ -637,6 +657,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
             },
 
             .comment => {
+                const zone = tracy.trace(@src());
+                defer zone.end();
                 std.debug.assert(direction == .enter);
 
                 try w.writeAll(current.open.slice(src));
@@ -651,6 +673,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
             },
 
             .doctype => {
+                const zone = tracy.trace(@src());
+                defer zone.end();
                 last_rbracket = current.open.end;
                 const maybe_name, const maybe_extra = blk: {
                     var tt: Tokenizer = .{ .language = ast.language };
@@ -691,6 +715,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
 
             .element, .element_void, .element_self_closing => switch (direction) {
                 .enter => {
+                    const zone = tracy.trace(@src());
+                    defer zone.end();
                     last_rbracket = current.open.end;
                     var tt: Tokenizer = .{
                         .idx = current.open.start,
@@ -803,6 +829,8 @@ pub fn render(ast: Ast, src: []const u8, w: anytype) !void {
                     }
                 },
                 .exit => {
+                    const zone = tracy.trace(@src());
+                    defer zone.end();
                     std.debug.assert(current.kind != .element_void);
                     std.debug.assert(current.kind != .element_self_closing);
                     last_rbracket = current.close.end;
@@ -865,16 +893,8 @@ const Formatter = struct {
     ast: Ast,
     src: []const u8,
 
-    pub fn format(
-        f: Formatter,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        out_stream: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
-        try f.ast.render(f.src, out_stream);
+    pub fn format(f: Formatter, w: *Writer) !void {
+        try f.ast.render(f.src, w);
     }
 };
 
@@ -930,7 +950,7 @@ test "basics" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(case, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "basics - attributes" {
@@ -941,7 +961,7 @@ test "basics - attributes" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(case, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "newlines" {
@@ -957,7 +977,7 @@ test "newlines" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(case, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "bad html" {
@@ -974,7 +994,7 @@ test "bad html" {
     const ast = try Ast.init(std.testing.allocator, case);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(case, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "formatting - simple" {
@@ -995,7 +1015,7 @@ test "formatting - simple" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "formatting - attributes" {
@@ -1027,7 +1047,7 @@ test "formatting - attributes" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "pre" {
@@ -1044,7 +1064,7 @@ test "pre" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "pre text" {
@@ -1062,7 +1082,7 @@ test "pre text" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "what" {
@@ -1098,7 +1118,7 @@ test "what" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "spans" {
@@ -1134,7 +1154,7 @@ test "spans" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 test "arrow span" {
     const case =
@@ -1148,7 +1168,7 @@ test "arrow span" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 test "self-closing tag complex example" {
@@ -1172,7 +1192,7 @@ test "self-closing tag complex example" {
     const ast = try Ast.init(std.testing.allocator, case, .html);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{s}", .{ast.formatter(case)});
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
 }
 
 pub const Cursor = struct {
