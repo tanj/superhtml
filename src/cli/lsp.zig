@@ -26,6 +26,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var handler: Handler = .{
         .gpa = gpa,
         .transport = &stdio.transport,
+        .strict = true,
     };
     defer handler.deinit();
 
@@ -43,6 +44,7 @@ gpa: std.mem.Allocator,
 transport: *lsp.Transport,
 files: std.StringHashMapUnmanaged(Document) = .{},
 offset_encoding: offsets.Encoding = .@"utf-16",
+strict: bool,
 
 fn deinit(self: *Handler) void {
     var file_it = self.files.valueIterator();
@@ -97,12 +99,32 @@ pub fn initialize(
             .@"utf-16" => .@"utf-16",
             .@"utf-32" => .@"utf-32",
         },
+
         .textDocumentSync = .{
             .TextDocumentSyncOptions = .{
                 .openClose = true,
                 .change = .Full,
             },
         },
+
+        .codeActionProvider = .{ .bool = true },
+
+        .renameProvider = .{
+            .RenameOptions = .{
+                .prepareProvider = true,
+            },
+        },
+
+        .documentHighlightProvider = .{ .bool = true },
+
+        .linkedEditingRangeProvider = .{ .bool = true },
+
+        .referencesProvider = .{ .bool = true },
+
+        .completionProvider = .{
+            .triggerCharacters = &.{ "<", "/" },
+        },
+
         .documentFormattingProvider = .{ .bool = true },
     };
 
@@ -230,8 +252,271 @@ pub fn @"textDocument/formatting"(
 
     return try arena.dupe(types.TextEdit, &.{.{
         .range = range,
-        .newText = aw.getWritten(),
+        .newText = aw.written(),
     }});
+}
+
+pub fn @"textDocument/codeAction"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.CodeActionParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/codeAction") {
+    const doc = self.files.getPtr(request.textDocument.uri) orelse return null;
+    const offset = lsp.offsets.positionToIndex(
+        doc.src,
+        request.range.start,
+        self.offset_encoding,
+    );
+
+    if (!self.strict) return null;
+
+    for (doc.html.errors) |err| {
+        if (err.tag != .ast or err.tag.ast != .invalid_html_tag_name) continue;
+
+        const span = err.main_location;
+        if (span.start <= offset and span.end > offset) {
+            const edits = try arena.alloc(lsp.types.TextEdit, 2);
+            edits[0] = .{
+                .range = getRange(span, doc.src),
+                .newText = "div",
+            };
+
+            const edits_len: usize = if (err.node_idx != 0) blk: {
+                const node = doc.html.nodes[err.node_idx];
+                if (node.kind != .element) break :blk 1;
+
+                const close = node.close;
+                if (close.end < 2 or close.start > close.end - 2) break :blk 1;
+
+                edits[1] = .{
+                    .range = getRange(.{
+                        .start = close.start + 1,
+                        .end = close.end - 1,
+                    }, doc.src),
+                    .newText = "/div",
+                };
+
+                break :blk 2;
+            } else 1;
+
+            const result: lsp.ResultType("textDocument/codeAction") = &.{
+                .{
+                    .CodeAction = .{
+                        .title = "Replace with 'div'",
+                        .kind = .quickfix,
+                        .isPreferred = true,
+                        .edit = .{
+                            .changes = .{
+                                .map = try .init(
+                                    arena,
+                                    &.{request.textDocument.uri},
+                                    &.{edits[0..edits_len]},
+                                ),
+                            },
+                        },
+                    },
+                },
+            };
+
+            return try arena.dupe(@typeInfo(@TypeOf(result.?)).pointer.child, result.?);
+        }
+    }
+
+    return null;
+}
+
+pub fn @"textDocument/prepareRename"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.PrepareRenameParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/prepareRename") {
+    _ = arena;
+
+    const doc = self.files.getPtr(request.textDocument.uri) orelse return null;
+    const offset = lsp.offsets.positionToIndex(
+        doc.src,
+        request.position,
+        self.offset_encoding,
+    );
+
+    const node_idx = findNode(doc, @intCast(offset));
+    if (node_idx == 0) return null;
+
+    const node = doc.html.nodes[node_idx];
+    const it = node.startTagIterator(doc.src, doc.language);
+
+    const range = lsp.offsets.locToRange(doc.src, .{
+        .start = it.name_span.start,
+        .end = it.name_span.end,
+    }, self.offset_encoding);
+
+    return .{
+        .Range = range,
+    };
+}
+
+pub fn @"textDocument/rename"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.RenameParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/rename") {
+    const ranges = try tagRanges(
+        self,
+        arena,
+        .{ .textDocument = request.textDocument, .position = request.position },
+    ) orelse return null;
+    const edits = try arena.alloc(types.TextEdit, ranges.len);
+
+    for (edits, ranges) |*edit, range| {
+        edit.* = .{
+            .range = range,
+            .newText = request.newName,
+        };
+    }
+    return .{
+        .changes = .{
+            .map = try .init(
+                arena,
+                &.{request.textDocument.uri},
+                &.{edits},
+            ),
+        },
+    };
+}
+
+pub fn @"textDocument/documentHighlight"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.DocumentHighlightParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/documentHighlight") {
+    const ranges = try tagRanges(
+        self,
+        arena,
+        .{ .textDocument = request.textDocument, .position = request.position },
+    ) orelse return null;
+    const highlights = try arena.alloc(types.DocumentHighlight, ranges.len);
+
+    for (highlights, ranges) |*highlight, range| {
+        highlight.* = .{ .range = range };
+    }
+
+    return highlights;
+}
+
+pub fn @"textDocument/linkedEditingRange"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.LinkedEditingRangeParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/linkedEditingRange") {
+    const ranges = try tagRanges(
+        self,
+        arena,
+        .{ .textDocument = request.textDocument, .position = request.position },
+    ) orelse return null;
+    const highlights = try arena.alloc(types.Range, ranges.len);
+
+    for (highlights, ranges) |*highlight, range| {
+        highlight.* = range;
+    }
+
+    return .{ .ranges = highlights };
+}
+
+pub fn @"textDocument/references"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.ReferenceParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/references") {
+    const doc = self.files.getPtr(request.textDocument.uri) orelse return null;
+    const offset = lsp.offsets.positionToIndex(
+        doc.src,
+        request.position,
+        self.offset_encoding,
+    );
+
+    const node_idx = findNode(doc, @intCast(offset));
+    log.debug("------ References request! (node: {}) ------", .{node_idx});
+    if (node_idx == 0) return null;
+
+    const class = blk: {
+        const node = doc.html.nodes[node_idx];
+        var it = node.startTagIterator(doc.src, doc.language);
+        while (it.next(doc.src)) |attr| {
+            if (std.ascii.eqlIgnoreCase(attr.name.slice(doc.src), "class")) {
+                const value = attr.value orelse return null;
+                const slice = value.span.slice(doc.src);
+                if (slice.len == 0 or slice[0] == '$') return null;
+                if (offset < value.span.start or offset >= value.span.end) return null;
+
+                const rel_offset = offset - value.span.start;
+
+                var vit = std.mem.tokenizeScalar(u8, slice, ' ');
+
+                while (vit.next()) |cls| {
+                    if (rel_offset < vit.index - cls.len) return null;
+                    if (vit.index > rel_offset) {
+                        break :blk cls;
+                    }
+                } else return null;
+            }
+        } else return null;
+    };
+
+    log.debug("------ CLASS: '{s}' ------", .{class});
+
+    var locations: std.ArrayListUnmanaged(lsp.types.Location) = .empty;
+    for (doc.html.nodes) |n| {
+        switch (n.kind) {
+            .element, .element_void, .element_self_closing => {},
+            else => continue,
+        }
+
+        var it = n.startTagIterator(doc.src, doc.language);
+        outer: while (it.next(doc.src)) |attr| {
+            if (std.ascii.eqlIgnoreCase(attr.name.slice(doc.src), "class")) {
+                const value = attr.value orelse break :outer;
+                const slice = value.span.slice(doc.src);
+                if (slice.len == 0 or slice[0] == '$') break :outer;
+                var vit = std.mem.tokenizeScalar(u8, slice, ' ');
+                while (vit.next()) |cls| {
+                    if (std.mem.eql(u8, class, cls)) {
+                        const range = lsp.offsets.locToRange(doc.src, .{
+                            .start = value.span.start + vit.index - cls.len,
+                            .end = value.span.start + vit.index,
+                        }, self.offset_encoding);
+
+                        try locations.append(arena, .{
+                            .uri = request.textDocument.uri,
+                            .range = range,
+                        });
+                        break :outer;
+                    }
+                }
+            }
+        }
+    }
+
+    return locations.items;
+}
+
+pub fn @"textDocument/completion"(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    request: types.CompletionParams,
+) error{OutOfMemory}!lsp.ResultType("textDocument/completion") {
+    const doc = self.files.getPtr(request.textDocument.uri) orelse return null;
+    const offset = lsp.offsets.positionToIndex(
+        doc.src,
+        request.position,
+        self.offset_encoding,
+    );
+
+    _ = offset;
+    _ = arena;
+    return null;
+    // const completions = doc.html.completions(arena, @intCast(offset));
+
+    // _ = completions;
 }
 
 pub fn onResponse(
@@ -247,5 +532,84 @@ pub fn getRange(span: super.Span, src: []const u8) types.Range {
     return .{
         .start = .{ .line = r.start.row, .character = r.start.col },
         .end = .{ .line = r.end.row, .character = r.end.col },
+    };
+}
+
+// Returns a node index, 0 == not found
+pub fn findNode(doc: *const Document, offset: u32) u32 {
+    if (doc.html.nodes.len < 2) return 0;
+    var cur_idx: u32 = 1;
+    while (cur_idx != 0) {
+        const n = doc.html.nodes[cur_idx];
+        if (n.open.start <= offset and n.open.end > offset) {
+            break;
+        }
+        if (n.close.end != 0 and n.close.start <= offset and n.close.end > offset) {
+            break;
+        }
+
+        if (n.open.end <= offset and n.close.start > offset) {
+            cur_idx = n.first_child_idx;
+        } else {
+            cur_idx = n.next_idx;
+        }
+    }
+
+    return cur_idx;
+}
+
+pub fn tagRanges(
+    self: *Handler,
+    arena: std.mem.Allocator,
+    position: types.TextDocumentPositionParams,
+) error{OutOfMemory}!?[]const types.Range {
+    const doc = self.files.getPtr(position.textDocument.uri) orelse return null;
+    const offset = lsp.offsets.positionToIndex(
+        doc.src,
+        position.position,
+        self.offset_encoding,
+    );
+
+    const node_idx: u32 = for (doc.html.errors) |err| {
+        // Find erroneous end tags in the error list but also any other error that
+        // has a node associated that happens to match our offset.
+        const span = err.main_location;
+        if (span.start <= offset and span.end > offset) {
+            if (err.tag == .ast and err.tag.ast == .erroneous_end_tag) {
+                const ranges = try arena.alloc(types.Range, 1);
+                ranges[0] = getRange(span, doc.src);
+                return ranges;
+            }
+            if (err.node_idx != 0) break err.node_idx;
+        }
+    } else findNode(doc, @intCast(offset));
+
+    const node = doc.html.nodes[node_idx];
+    return blk: switch (node.kind) {
+        else => return null,
+        .element => {
+            const ranges = try arena.alloc(types.Range, 2);
+
+            const it = node.startTagIterator(doc.src, doc.language);
+            ranges[0] = getRange(it.name_span, doc.src);
+
+            const close = node.close;
+            if (close.end < 2 or close.start > close.end - 2) {
+                break :blk ranges[0..1];
+            }
+
+            ranges[1] = getRange(.{
+                .start = @intCast(close.start + "</".len),
+                .end = close.end - 1,
+            }, doc.src);
+            break :blk ranges;
+        },
+        .element_void, .element_self_closing => {
+            const ranges = try arena.alloc(lsp.types.Range, 1);
+
+            const it = node.startTagIterator(doc.src, doc.language);
+            ranges[0] = getRange(it.name_span, doc.src);
+            break :blk ranges;
+        },
     };
 }

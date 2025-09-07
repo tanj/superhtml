@@ -1,6 +1,7 @@
 const Ast = @This();
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const tracy = @import("tracy");
 const root = @import("../root.zig");
@@ -61,6 +62,136 @@ const unsupported_names = TagNameMap.initComptime(.{
     .{ "spacer", {} },
     .{ "tt", {} },
 });
+
+const valid_html_tags: TagNameMap = blk: {
+    const Item = struct { []const u8 };
+    var list: []const Item = &.{};
+    for (std.meta.fields(ValidHtmlTags)) |f| list = list ++ &[_]Item{.{f.name}};
+    break :blk .initComptime(list);
+};
+
+const valid_shtml_tags = TagNameMap.initComptime(.{
+    .{ "extend", {} },
+    .{ "super", {} },
+    .{ "ctx", {} },
+});
+
+const ValidShtmlTags = enum {
+    extend,
+    super,
+    ctx,
+};
+const ValidHtmlTags = enum {
+    a,
+    abbr,
+    address,
+    area,
+    article,
+    aside,
+    audio,
+    b,
+    base,
+    bdi,
+    bdo,
+    blockquote,
+    body,
+    br,
+    button,
+    canvas,
+    caption,
+    cite,
+    code,
+    col,
+    colgroup,
+    data,
+    datalist,
+    dd,
+    del,
+    details,
+    dfn,
+    dialog,
+    div,
+    dl,
+    dt,
+    em,
+    embed,
+    fencedframe,
+    fieldset,
+    figcaption,
+    figure,
+    footer,
+    form,
+    h1,
+    head,
+    header,
+    hgroup,
+    hr,
+    html,
+    i,
+    iframe,
+    img,
+    input,
+    ins,
+    kbd,
+    label,
+    legend,
+    li,
+    link,
+    main,
+    map,
+    mark,
+    menu,
+    meta,
+    meter,
+    nav,
+    noscript,
+    object,
+    ol,
+    optgroup,
+    option,
+    output,
+    p,
+    picture,
+    pre,
+    progress,
+    q,
+    rp,
+    rt,
+    ruby,
+    s,
+    samp,
+    script,
+    search,
+    section,
+    select,
+    selectedcontent,
+    slot,
+    small,
+    source,
+    span,
+    strong,
+    style,
+    sub,
+    summary,
+    sup,
+    table,
+    tbody,
+    td,
+    template,
+    textarea,
+    tfoot,
+    th,
+    thead,
+    time,
+    title,
+    tr,
+    track,
+    u,
+    ul,
+    @"var",
+    video,
+    wbr,
+};
 
 pub const Node = struct {
     kind: Kind,
@@ -152,6 +283,7 @@ pub const Error = struct {
     tag: union(enum) {
         token: Tokenizer.TokenError,
         ast: enum {
+            invalid_html_tag_name,
             html_elements_cant_self_close,
             missing_end_tag,
             erroneous_end_tag,
@@ -160,6 +292,7 @@ pub const Error = struct {
         },
     },
     main_location: Span,
+    node_idx: u32, // 0 = missing node
 };
 
 language: Language,
@@ -189,22 +322,25 @@ pub fn printErrors(
     }
 }
 
-pub fn deinit(ast: Ast, gpa: std.mem.Allocator) void {
+pub fn deinit(ast: Ast, gpa: Allocator) void {
     gpa.free(ast.nodes);
     gpa.free(ast.errors);
 }
 
 pub fn init(
-    gpa: std.mem.Allocator,
+    gpa: Allocator,
     src: []const u8,
     language: Language,
+    /// When true only official HTML tag names will be allowed.
+    /// Strict mode currently only supports HTML and SuperHTML.
+    strict_tag_names: bool,
 ) error{OutOfMemory}!Ast {
     if (src.len > std.math.maxInt(u32)) @panic("too long");
 
-    var nodes = std.ArrayList(Node).init(gpa);
+    var nodes = std.array_list.Managed(Node).init(gpa);
     errdefer nodes.deinit();
 
-    var errors = std.ArrayList(Error).init(gpa);
+    var errors = std.array_list.Managed(Error).init(gpa);
     errdefer errors.deinit();
 
     var seen_attrs = std.StringHashMap(void).init(gpa);
@@ -230,6 +366,7 @@ pub fn init(
     var current: *Node = &nodes.items[0];
     var current_idx: u32 = 0;
     var svg_lvl: u32 = 0;
+    var math_lvl: u32 = 0;
     while (tokenizer.next(src)) |t| {
         log.debug("cur_idx: {} cur_kind: {s} tok: {any}", .{
             current_idx,
@@ -273,6 +410,7 @@ pub fn init(
                                         .ast = .html_elements_cant_self_close,
                                     },
                                     .main_location = tag.name,
+                                    .node_idx = current_idx + 1,
                                 });
                             }
                             break :blk .element_self_closing;
@@ -286,6 +424,27 @@ pub fn init(
                     const name = tag.name.slice(src);
                     if (std.ascii.eqlIgnoreCase(tag.name.slice(src), "svg")) {
                         svg_lvl += 1;
+                    }
+                    if (std.ascii.eqlIgnoreCase(tag.name.slice(src), "math")) {
+                        math_lvl += 1;
+                    }
+
+                    if (language != .xml and
+                        strict_tag_names and
+                        svg_lvl == 0 and
+                        math_lvl == 0 and
+                        std.mem.indexOfScalar(u8, name, '-') == null)
+                    blk: {
+                        const valid_html = valid_html_tags.has(name);
+                        const valid_shtml = valid_shtml_tags.has(name);
+                        if (valid_html or (language == .superhtml and valid_shtml)) break :blk;
+                        try errors.append(.{
+                            .tag = .{
+                                .ast = .invalid_html_tag_name,
+                            },
+                            .main_location = tag.name,
+                            .node_idx = current_idx + 1,
+                        });
                     }
 
                     var new: Node = .{ .kind = node_kind, .open = tag.span };
@@ -318,6 +477,7 @@ pub fn init(
                                 .ast = .deprecated_and_unsupported,
                             },
                             .main_location = tag.name,
+                            .node_idx = current_idx,
                         });
                     }
 
@@ -355,6 +515,7 @@ pub fn init(
                                                 .start = attr.name.start,
                                                 .end = attr.name.end,
                                             },
+                                            .node_idx = current_idx,
                                         });
                                     }
                                 },
@@ -369,6 +530,7 @@ pub fn init(
                                 .ast = .erroneous_end_tag,
                             },
                             .main_location = tag.name,
+                            .node_idx = 0,
                         });
                         continue;
                     }
@@ -392,6 +554,7 @@ pub fn init(
                             try errors.append(.{
                                 .tag = .{ .ast = .erroneous_end_tag },
                                 .main_location = tag.name,
+                                .node_idx = 0,
                             });
                             break;
                         }
@@ -422,6 +585,9 @@ pub fn init(
                             if (std.ascii.eqlIgnoreCase(current_name, "svg")) {
                                 svg_lvl -= 1;
                             }
+                            if (std.ascii.eqlIgnoreCase(current_name, "math")) {
+                                math_lvl -= 1;
+                            }
                             current.close = tag.span;
                             var cur = original_current;
                             while (cur != current) {
@@ -441,6 +607,7 @@ pub fn init(
                                     try errors.append(.{
                                         .tag = .{ .ast = .missing_end_tag },
                                         .main_location = cur_name,
+                                        .node_idx = current_idx,
                                     });
                                 }
 
@@ -515,6 +682,7 @@ pub fn init(
                         .token = pe.tag,
                     },
                     .main_location = pe.span,
+                    .node_idx = current_idx,
                 });
             },
         }
@@ -526,9 +694,11 @@ pub fn init(
             try errors.append(.{
                 .tag = .{ .ast = .missing_end_tag },
                 .main_location = current.open,
+                .node_idx = current_idx,
             });
         }
 
+        current_idx = current.parent_idx;
         current = &nodes.items[current.parent_idx];
     }
 
@@ -541,9 +711,10 @@ pub fn init(
 
 pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
     std.debug.assert(ast.errors.len == 0);
+    if (ast.nodes.len < 2) return;
 
     var indentation: u32 = 0;
-    var current = ast.nodes[0];
+    var current = ast.nodes[1];
     var direction: enum { enter, exit } = .enter;
     var last_rbracket: u32 = 0;
     // var last_open_was_vertical = false;
@@ -575,7 +746,15 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
 
                     if (vertical) {
                         log.debug("adding a newline", .{});
-                        try w.writeAll("\n");
+                        const lines = std.mem.count(u8, maybe_ws, "\n");
+                        if (last_rbracket > 0) {
+                            if (lines >= 2) {
+                                try w.writeAll("\n\n");
+                            } else {
+                                try w.writeAll("\n");
+                            }
+                        }
+
                         for (0..indentation) |_| {
                             try w.writeAll(indent_string);
                         }
@@ -593,7 +772,10 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                 std.debug.assert(current.kind != .text);
                 std.debug.assert(current.kind != .element_void);
                 std.debug.assert(current.kind != .element_self_closing);
-                if (current.kind == .root) return;
+                if (current.kind == .root) {
+                    try w.writeAll("\n");
+                    return;
+                }
 
                 log.debug("rendering exit ({}): {s} {any}", .{
                     indentation,
@@ -746,9 +928,10 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                         .element_void,
                         .element_self_closing,
                         => 1,
-                        else => 0,
+                        else => @intCast(name.len),
                     };
 
+                    var first = true;
                     while (tt.next(src[0..current.open.end])) |maybe_attr| {
                         log.debug("tt: {s}", .{@tagName(maybe_attr)});
                         log.debug("tt: {any}", .{maybe_attr});
@@ -770,9 +953,14 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                             .tag => break,
                             .attr => |attr| {
                                 if (vertical) {
-                                    try w.print("\n", .{});
-                                    for (0..indentation + extra) |_| {
+                                    if (first) {
+                                        first = false;
                                         try w.print(indent_string, .{});
+                                    } else {
+                                        try w.print("\n", .{});
+                                        for (0..(indentation * 2) + extra) |_| {
+                                            try w.print(indent_string, .{});
+                                        }
                                     }
                                 } else {
                                     try w.print(" ", .{});
@@ -797,7 +985,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                     }
                     if (vertical) {
                         try w.print("\n", .{});
-                        for (0..indentation + extra -| 1) |_| {
+                        for (0..indentation -| 1) |_| {
                             try w.print(indent_string, .{});
                         }
                     }
@@ -860,6 +1048,13 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
             },
         }
     }
+}
+
+pub fn completions(ast: Ast, gpa: Allocator, offset: u32) []const []const u8 {
+    _ = ast;
+    _ = gpa;
+    _ = offset;
+    return &.{};
 }
 
 fn at(ast: Ast, idx: u32) ?Node {
@@ -945,9 +1140,9 @@ fn debugNodes(nodes: []const Node, src: []const u8) void {
 }
 
 test "basics" {
-    const case = "<html><head></head><body><div><link></div></body></html>";
+    const case = "<html><head></head><body><div><link></div></body></html>\n";
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -956,9 +1151,9 @@ test "basics" {
 test "basics - attributes" {
     const case = "<html><head></head><body>" ++
         \\<div id="foo" class="bar">
-    ++ "<link></div></body></html>";
+    ++ "<link></div></body></html>\n";
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -973,8 +1168,9 @@ test "newlines" {
         \\    <div><link></div>
         \\  </body>
         \\</html>
+        \\
     ;
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -991,7 +1187,7 @@ test "bad html" {
         \\
         \\</html>
     ;
-    const ast = try Ast.init(std.testing.allocator, case);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -1011,8 +1207,9 @@ test "formatting - simple" {
         \\    <div><link></div>
         \\  </body>
         \\</html>
+        \\
     ;
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1028,23 +1225,23 @@ test "formatting - attributes" {
         \\      ></div>
         \\    </div>
         \\  </body>
-        \\</html>     
+        \\</html>
     ;
     const expected =
         \\<html>
         \\  <body>
         \\    <div>
         \\      <link>
-        \\      <div
-        \\        id="foo"
-        \\        class="bar"
-        \\        style="tarstarstarstarstarstarstarst"
+        \\      <div id="foo"
+        \\           class="bar"
+        \\           style="tarstarstarstarstarstarstarst"
         \\      ></div>
         \\    </div>
         \\  </body>
         \\</html>
+        \\
     ;
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1059,9 +1256,10 @@ test "pre" {
         \\<b>
         \\</b>
         \\<pre>      </pre>
+        \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1077,9 +1275,10 @@ test "pre text" {
         \\  banana
         \\</b>
         \\<pre>   banana   </pre>
+        \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1112,10 +1311,12 @@ test "what" {
         \\    </a>
         \\  </body>
         \\</html>
+        \\
         \\<a href="#">foo</a>
+        \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1149,9 +1350,10 @@ test "spans" {
         \\    <span>World</span>
         \\  </body>
         \\</html>
+        \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1163,9 +1365,10 @@ test "arrow span" {
     const expected =
         \\<a href="$if.permalink()">←
         \\  <span var="$if.title"></span></a>
+        \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1179,17 +1382,72 @@ test "self-closing tag complex example" {
         \\<svg viewBox="0 0 24 24">
         \\<path d="M14.4,6H20V16H13L12.6,14H7V21H5V4H14L14.4,6M14,14H16V12H18V10H16V8H14V10L13,8V6H11V8H9V6H7V8H9V10H7V12H9V10H11V12H13V10L14,12V14M11,10V8H13V10H11M14,10H16V12H14V10Z" />
         \\</svg>
-        \\</div>        
+        \\</div>
     ;
     const expected =
         \\extend template="base.html"/>
+        \\
         \\<div id="content">
         \\  <svg viewBox="0 0 24 24">
         \\    <path d="M14.4,6H20V16H13L12.6,14H7V21H5V4H14L14.4,6M14,14H16V12H18V10H16V8H14V10L13,8V6H11V8H9V6H7V8H9V10H7V12H9V10H11V12H13V10L14,12V14M11,10V8H13V10H11M14,10H16V12H14V10Z"/>
         \\  </svg>
         \\</div>
+        \\
     ;
-    const ast = try Ast.init(std.testing.allocator, case, .html);
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
+}
+
+test "respect empty lines" {
+    const case =
+        \\
+        \\<div> a
+        \\</div>
+        \\
+        \\<div></div>
+        \\
+        \\<div></div>
+        \\<div></div>
+        \\
+        \\
+        \\<div></div>
+        \\
+        \\
+        \\
+        \\<div></div>
+        \\<div> a
+        \\</div>
+        \\
+        \\
+        \\
+        \\<div> a
+        \\</div>
+    ;
+    const expected =
+        \\<div>
+        \\  a
+        \\</div>
+        \\
+        \\<div></div>
+        \\
+        \\<div></div>
+        \\<div></div>
+        \\
+        \\<div></div>
+        \\
+        \\<div></div>
+        \\<div>
+        \\  a
+        \\</div>
+        \\
+        \\<div>
+        \\  a
+        \\</div>
+        \\
+    ;
+    const ast = try Ast.init(std.testing.allocator, case, .html, true);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
