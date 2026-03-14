@@ -48,6 +48,8 @@ pub const picture: Element = .{
 fn validate(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
@@ -57,8 +59,6 @@ fn validate(
     const first_child_idx = parent.first_child_idx;
 
     const source_attrs = comptime Attribute.element_attrs.get(.source);
-    var seen_attrs: std.StringHashMapUnmanaged(Span) = .empty;
-    defer seen_attrs.deinit(gpa);
 
     // Used to catch duplicate descriptors in image candidate strings
     var seen_descriptors: std.StringArrayHashMapUnmanaged(Span) = .empty;
@@ -110,7 +110,8 @@ fn validate(
                 .source => {
                     var vait: ValidatingIterator = .init(
                         errors,
-                        &seen_attrs,
+                        seen_attrs,
+                        seen_ids,
                         .html,
                         child.open,
                         src,
@@ -773,28 +774,16 @@ fn completions(
         }
     }
 
-    const source = comptime Element.all.get(.source);
-    const img = comptime Element.all.get(.img);
-    const script = comptime Element.all.get(.script);
-    const template = comptime Element.all.get(.template);
+    const source = comptime Element.all_completions.get(.source);
+    const img = comptime Element.all_completions.get(.img);
+    const script = comptime Element.all_completions.get(.script);
+    const template = comptime Element.all_completions.get(.template);
 
     return switch (state) {
         .source => switch (kind_after_cursor) {
-            .source, .img => &.{
-                .{ .label = @tagName(source.tag), .desc = source.desc },
-                .{ .label = @tagName(script.tag), .desc = script.desc },
-                .{ .label = @tagName(template.tag), .desc = template.desc },
-            },
-            else => &.{
-                .{ .label = @tagName(source.tag), .desc = source.desc },
-                .{ .label = @tagName(img.tag), .desc = img.desc },
-                .{ .label = @tagName(script.tag), .desc = script.desc },
-                .{ .label = @tagName(template.tag), .desc = template.desc },
-            },
+            .source, .img => &.{ source, script, template },
+            else => &.{ source, img, script, template },
         },
-        .img => &.{
-            .{ .label = @tagName(script.tag), .desc = script.desc },
-            .{ .label = @tagName(template.tag), .desc = template.desc },
-        },
+        .img => &.{ script, template },
     };
 }

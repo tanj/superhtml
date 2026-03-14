@@ -1,6 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const root = @import("../../root.zig");
+const Span = root.Span;
 const Ast = @import("../Ast.zig");
 const Element = @import("../Element.zig");
 
@@ -33,10 +35,14 @@ pub const table: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
+    _ = seen_attrs;
+    _ = seen_ids;
 
     // In this order: optionally a caption element, followed by zero or more
     // colgroup elements, followed optionally by a thead element, followed by
@@ -665,14 +671,14 @@ fn completionsContent(
     }
 
     const prefix: []const Ast.Completion = &.{
-        .{ .label = "caption", .desc = comptime Element.all.get(.caption).desc },
-        .{ .label = "colgroup", .desc = comptime Element.all.get(.colgroup).desc },
-        .{ .label = "thead", .desc = comptime Element.all.get(.thead).desc },
-        .{ .label = "tbody", .desc = comptime Element.all.get(.tbody).desc },
-        .{ .label = "tr", .desc = comptime Element.all.get(.tr).desc },
-        .{ .label = "tfoot", .desc = comptime Element.all.get(.tfoot).desc },
-        .{ .label = "script", .desc = comptime Element.all.get(.script).desc },
-        .{ .label = "template", .desc = comptime Element.all.get(.template).desc },
+        comptime Element.all_completions.get(.caption),
+        comptime Element.all_completions.get(.colgroup),
+        comptime Element.all_completions.get(.thead),
+        comptime Element.all_completions.get(.tbody),
+        comptime Element.all_completions.get(.tr),
+        comptime Element.all_completions.get(.tfoot),
+        comptime Element.all_completions.get(.script),
+        comptime Element.all_completions.get(.template),
     };
 
     return switch (state) {

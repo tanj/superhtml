@@ -46,10 +46,14 @@ pub const datalist: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
+    _ = seen_attrs;
+    _ = seen_ids;
     // Either: phrasing content.
     // Or: Zero or more option and script-supporting elements.
 
@@ -138,9 +142,9 @@ fn completionsContent(
             .{},
         ),
         .option => &.{
-            .{ .label = "option", .desc = comptime Element.all.get(.option).desc },
-            .{ .label = "script", .desc = comptime Element.all.get(.script).desc },
-            .{ .label = "template", .desc = comptime Element.all.get(.template).desc },
+            Element.all_completions.get(.option),
+            Element.all_completions.get(.script),
+            Element.all_completions.get(.template),
         },
         .phrasing => Element.simpleCompletions(
             arena,

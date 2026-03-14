@@ -38,10 +38,14 @@ pub const dl: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
+    _ = seen_attrs;
+    _ = seen_ids;
     // Either: Zero or more groups each consisting of one or more dt elements followed by one or more dd elements, optionally intermixed with script-supporting elements.
     // Or: One or more div elements, optionally intermixed with script-supporting elements.
 
@@ -187,23 +191,8 @@ fn completions(
         .div => &.{ div, script, template },
     };
 }
-const dt: Ast.Completion = .{
-    .label = "dt",
-    .desc = Element.all.get(.dt).desc,
-};
-const dd: Ast.Completion = .{
-    .label = "dd",
-    .desc = Element.all.get(.dd).desc,
-};
-const div: Ast.Completion = .{
-    .label = "div",
-    .desc = Element.all.get(.div).desc,
-};
-const script: Ast.Completion = .{
-    .label = "script",
-    .desc = Element.all.get(.script).desc,
-};
-const template: Ast.Completion = .{
-    .label = "template",
-    .desc = Element.all.get(.template).desc,
-};
+const dt: Ast.Completion = Element.all_completions.get(.dt);
+const dd: Ast.Completion = Element.all_completions.get(.dd);
+const div: Ast.Completion = Element.all_completions.get(.div);
+const script: Ast.Completion = Element.all_completions.get(.script);
+const template: Ast.Completion = Element.all_completions.get(.template);

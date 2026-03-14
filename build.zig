@@ -1,16 +1,11 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const version: Version = if (b.option(
-        []const u8,
-        "force-version",
-        "When building the SuperHTML CLI tool force a specific version, bypassing 'git describe'",
-    )) |v| .{ .commit = v } else getVersion(b);
-
     const enable_tracy = b.option(bool, "tracy", "Enable Tracy profiling") orelse false;
+    const version = b.option([]const u8, "version", "Override the version of SuperHTML") orelse zon.version;
 
     const tracy = b.dependency("tracy", .{ .enable = enable_tracy });
     const scripty = b.dependency("scripty", .{
@@ -22,9 +17,22 @@ pub fn build(b: *std.Build) !void {
     const superhtml = b.addModule("superhtml", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
     superhtml.addImport("scripty", scripty.module("scripty"));
     superhtml.addImport("tracy", tracy.module("tracy"));
+
+    const language_tag_parser = b.addExecutable(.{
+        .name = "language-tag-parser",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/html/language_tag/parse.zig"),
+            .target = target,
+        }),
+    });
+    const language_tag_parse = b.addRunArtifact(language_tag_parser);
+    superhtml.addImport("language-tag-registry", b.createModule(.{
+        .root_source_file = language_tag_parse.addOutputFileArg("registry.zon"),
+    }));
 
     if (target.result.os.tag == .windows) {
         superhtml.linkSystemLibrary("advapi32", .{});
@@ -51,8 +59,7 @@ pub fn build(b: *std.Build) !void {
     const scopes = b.option([]const []const u8, "scope", "Enable this scope (all scopes are enabled when none is specified through this option), can be used multiple times") orelse &[0][]const u8{};
     options.addOption(bool, "verbose_logging", verbose_logging);
     options.addOption([]const []const u8, "enabled_scopes", scopes);
-    options.addOption([]const u8, "version", version.string());
-    options.addOption(Version.Kind, "version_kind", version);
+    options.addOption([]const u8, "version", version);
 
     const folders = b.dependency("known_folders", .{});
     const lsp = b.dependency("lsp_kit", .{});
@@ -61,9 +68,47 @@ pub fn build(b: *std.Build) !void {
     setupTestStep(b, superhtml, check);
     setupCliTool(b, target, optimize, options, superhtml, folders, lsp);
     setupWasmStep(b, optimize, options, superhtml, lsp);
-    if (version == .tag) {
-        setupReleaseStep(b, options, superhtml, folders, lsp);
+    setupFetchLanguageSubtagRegistryStep(b, target);
+
+    const release = b.step("release", "Create release builds of Zine");
+    const git_version = getGitVersion(b);
+    if (git_version == .tag) {
+        if (std.mem.eql(u8, version, git_version.tag[1..])) {
+            setupReleaseStep(
+                b,
+                options,
+                superhtml,
+                folders,
+                lsp,
+                release,
+            );
+        } else {
+            release.dependOn(&b.addFail(b.fmt(
+                "error: git tag does not match zon package version (zon: '{s}', git: '{s}')",
+                .{ version, git_version.tag[1..] },
+            )).step);
+        }
+    } else {
+        release.dependOn(&b.addFail(
+            "error: git tag missing, cannot make release builds",
+        ).step);
     }
+
+    setupGeneratorStep(b, target);
+}
+
+fn setupGeneratorStep(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const gen = b.step("generator", "Build generator executable for reproing fuzz cases");
+    const supergen = b.addExecutable(.{
+        .name = "generator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generator.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    gen.dependOn(&b.addInstallArtifact(supergen, .{}).step);
 }
 
 fn setupCheckStep(
@@ -79,7 +124,7 @@ fn setupCheckStep(
     const super_cli_check = b.addExecutable(.{
         .name = "superhtml",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -106,8 +151,7 @@ fn setupTestStep(
 
     const unit_tests = b.addTest(.{
         .root_module = superhtml,
-        // .strip = true,
-        // .filter = "if-else-loop",
+        .filters = b.args orelse &.{},
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -126,7 +170,7 @@ fn setupCliTool(
     const super_cli = b.addExecutable(.{
         .name = "superhtml",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .single_threaded = true,
@@ -181,17 +225,35 @@ fn setupWasmStep(
     wasm.dependOn(&target_output.step);
 }
 
+fn setupFetchLanguageSubtagRegistryStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+) void {
+    const step = b.step(
+        "fetch-language-subtag-registry",
+        "Fetch the IANA language subtag registry",
+    );
+    const fetcher = b.addExecutable(.{
+        .name = "language-subtag-fetcher",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/html/language_tag/fetch.zig"),
+            .target = target,
+        }),
+    });
+    const fetch = b.addRunArtifact(fetcher);
+    fetch.has_side_effects = true;
+    fetch.addFileArg(b.path("src/html/language_tag/registry.txt"));
+    step.dependOn(&fetch.step);
+}
+
 fn setupReleaseStep(
     b: *std.Build,
     options: *std.Build.Step.Options,
     superhtml: *std.Build.Module,
     folders: *std.Build.Dependency,
     lsp: *std.Build.Dependency,
+    release_step: *std.Build.Step,
 ) void {
-    const release_step = b.step(
-        "release",
-        "Create releases for the SuperHTML CLI",
-    );
     const targets: []const std.Target.Query = &.{
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .linux },
@@ -207,7 +269,7 @@ fn setupReleaseStep(
         const super_exe_release = b.addExecutable(.{
             .name = "superhtml",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/cli.zig"),
+                .root_source_file = b.path("src/main.zig"),
                 .target = release_target,
                 .optimize = .ReleaseFast,
             }),
@@ -221,15 +283,53 @@ fn setupReleaseStep(
         super_exe_release.root_module.addImport("lsp", lsp.module("lsp"));
         super_exe_release.root_module.addOptions("build_options", options);
 
-        const target_output = b.addInstallArtifact(super_exe_release, .{
-            .dest_dir = .{
-                .override = .{
-                    .custom = t.zigTriple(b.allocator) catch unreachable,
-                },
-            },
-        });
+        switch (t.os_tag.?) {
+            .macos, .windows => {
+                const archive_name = b.fmt("{s}.zip", .{
+                    t.zigTriple(b.allocator) catch unreachable,
+                });
 
-        release_step.dependOn(&target_output.step);
+                const zip = b.addSystemCommand(&.{
+                    "zip",
+                    "-9",
+                    // "-dd",
+                    "-q",
+                    "-j",
+                });
+                const archive = zip.addOutputFileArg(archive_name);
+                zip.addDirectoryArg(super_exe_release.getEmittedBin());
+                _ = zip.captureStdOut();
+
+                release_step.dependOn(&b.addInstallFileWithDir(
+                    archive,
+                    .{ .custom = "releases" },
+                    archive_name,
+                ).step);
+            },
+            else => {
+                const archive_name = b.fmt("{s}.tar.xz", .{
+                    t.zigTriple(b.allocator) catch unreachable,
+                });
+
+                const tar = b.addSystemCommand(&.{
+                    "gtar",
+                    "-cJf",
+                });
+
+                const archive = tar.addOutputFileArg(archive_name);
+                tar.addArg("-C");
+
+                tar.addDirectoryArg(super_exe_release.getEmittedBinDirectory());
+                tar.addArg("superhtml");
+                _ = tar.captureStdOut();
+
+                release_step.dependOn(&b.addInstallFileWithDir(
+                    archive,
+                    .{ .custom = "releases" },
+                    archive_name,
+                ).step);
+            },
+        }
     }
 
     // wasm
@@ -252,15 +352,21 @@ fn setupReleaseStep(
         super_wasm_lsp.root_module.addImport("lsp", lsp.module("lsp"));
         super_wasm_lsp.root_module.addOptions("build_options", options);
 
-        const target_output = b.addInstallArtifact(super_wasm_lsp, .{
-            .dest_dir = .{
-                .override = .{
-                    .custom = "wasm-wasi-lsponly",
-                },
-            },
+        const archive_name = "wasm-wasi-lsponly.tar.xz";
+        const tar = b.addSystemCommand(&.{
+            "gtar",
+            "-cJf",
         });
-
-        release_step.dependOn(&target_output.step);
+        const archive = tar.addOutputFileArg(archive_name);
+        tar.addArg("-C");
+        tar.addDirectoryArg(super_wasm_lsp.getEmittedBinDirectory());
+        tar.addArg("superhtml.wasm");
+        _ = tar.captureStdOut();
+        release_step.dependOn(&b.addInstallFileWithDir(
+            archive,
+            .{ .custom = "releases" },
+            archive_name,
+        ).step);
     }
 }
 
@@ -279,7 +385,7 @@ const Version = union(Kind) {
         };
     }
 };
-fn getVersion(b: *std.Build) Version {
+fn getGitVersion(b: *std.Build) Version {
     const git_path = b.findProgram(&.{"git"}, &.{}) catch return .unknown;
     var out: u8 = undefined;
     const git_describe = std.mem.trim(

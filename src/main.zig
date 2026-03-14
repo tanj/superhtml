@@ -4,7 +4,6 @@ const build_options = @import("build_options");
 const known = @import("known_folders");
 const super = @import("super");
 const logging = @import("cli/logging.zig");
-const interface_exe = @import("cli/interface.zig");
 const check_exe = @import("cli/check.zig");
 const fmt_exe = @import("cli/fmt.zig");
 const lsp_exe = @import("cli/lsp.zig");
@@ -31,9 +30,8 @@ pub fn panic(
 ) noreturn {
     if (lsp_mode) {
         std.log.err("\n{s}\n\n{?f}", .{ msg, trace });
-    } else {
-        std.debug.print("\n{s}\n\n{?f}", .{ msg, trace });
     }
+
     blk: {
         const out: std.fs.File = if (!lsp_mode) std.fs.File.stderr() else logging.log_file orelse break :blk;
         var writer = out.writerStreaming(&.{});
@@ -43,17 +41,13 @@ pub fn panic(
             w.print("Unable to dump stack trace: debug info stripped\n", .{}) catch {};
             break :blk;
         }
-        const debug_info = std.debug.getSelfDebugInfo() catch |err| {
-            w.print(
-                "Unable to dump stack trace: Unable to open debug info: {s}\n",
-                .{@errorName(err)},
-            ) catch {};
-            break :blk;
-        };
-        std.debug.writeCurrentStackTrace(w, debug_info, .no_color, ret_addr) catch |err| {
-            w.print("Unable to dump stack trace: {t}\n", .{err}) catch {};
-            break :blk;
-        };
+
+        if (builtin.zig_version.minor != 15) {
+            std.debug.writeCurrentStackTrace(.{ .first_address = ret_addr }, w, .no_color) catch |err| {
+                w.print("Unable to dump stack trace: {t}\n", .{err}) catch {};
+                break :blk;
+            };
+        }
     }
 
     if (builtin.mode == .Debug) @breakpoint();
@@ -62,8 +56,6 @@ pub fn panic(
 
 pub const Command = enum {
     check,
-    interface,
-    i, // alias for interface
     fmt,
     lsp,
     help,
@@ -90,7 +82,6 @@ pub fn main() !void {
 
     _ = switch (cmd) {
         .check => check_exe.run(gpa, args[2..]),
-        .interface, .i => interface_exe.run(gpa, args[2..]),
         .fmt => fmt_exe.run(gpa, args[2..]),
         .lsp => lsp_exe.run(gpa, args[2..]),
         .help => fatalHelp(),
@@ -117,17 +108,15 @@ fn fatalHelp() noreturn {
         \\Usage: superhtml COMMAND [OPTIONS]
         \\
         \\Commands:
-        \\  check         Check documents for syntax errors
-        \\  interface, i  Print a SuperHTML template's interface
-        \\  fmt           Format documents
-        \\  lsp           Start the Super LSP
-        \\  help          Show this menu and exit
-        \\  version       Print Super's version and exit
+        \\  check         Check documents for errors.
+        \\  fmt           Format documents.
+        \\  lsp           Start the Language Server.
+        \\  help          Show this menu and exit.
+        \\  version       Print the version and exit.
         \\
         \\General Options:
-        \\  --help, -h        Print command specific usage
-        \\  --no-strict-tags  Disable strict checking of tag names
-        \\                    in HTML and SuperHTML files. 
+        \\  --help, -h        Print command specific usage.
+        \\  --syntax-only     Disable HTML element and attribute validation.
         \\
     , .{});
 }

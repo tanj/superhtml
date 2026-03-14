@@ -46,10 +46,14 @@ pub const hgroup: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
+    _ = seen_attrs;
+    _ = seen_ids;
     // Zero or more p elements, followed by one h1, h2, h3, h4, h5, or h6
     // element, followed by zero or more p elements, optionally intermixed with
     // script-supporting elements.
@@ -165,10 +169,7 @@ fn completionsContent(
         const tags = &.{ .p, .h1, .h2, .h3, .h4, .h5, .h6 };
 
         var all: [7]Ast.Completion = undefined;
-        for (&all, tags) |*a, t| a.* = .{
-            .label = @tagName(t),
-            .desc = Element.all.get(t).desc,
-        };
+        for (&all, tags) |*a, t| a.* = Element.all_completions.get(t);
         break :blk all;
     };
 

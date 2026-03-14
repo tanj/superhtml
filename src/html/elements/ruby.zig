@@ -55,10 +55,14 @@ pub const ruby: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
+    _ = seen_attrs;
+    _ = seen_ids;
     const parent = nodes[parent_idx];
     const parent_span = parent.span(src);
 
@@ -241,11 +245,7 @@ fn completionsContent(
             .none,
             .{},
         ),
-        .rp_start => &.{
-            .{ .label = "rt", .desc = comptime Element.all.get(.rt).desc },
-        },
-        .rp_rt => &.{
-            .{ .label = "rp", .desc = comptime Element.all.get(.rp).desc },
-        },
+        .rp_start => &.{comptime Element.all_completions.get(.rt)},
+        .rp_rt => &.{comptime Element.all_completions.get(.rp)},
     };
 }

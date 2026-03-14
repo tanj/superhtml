@@ -2,6 +2,35 @@
 
 All notable changes to the "super" extension will be documented in this file.
 
+## [v0.6.2]
+- The "boolean attributes cannot have a value" error now puts squigglies under the attribute name instead of the value.
+- Improved validation for `<link>` `[crossorigin]`, it previously used its own implementation of CORS validation, while now it uses one central implementation shared by all other similar attributes.
+- `[lang]` (and similar attributes) now accept the empty string as value, used to signify that the language is unknown.
+- Fixed a condition that would cause the language server to attempt to detect html elements inside of svg elements.
+
+## [v0.6.1]
+Fixes two bugs:
+
+- `fmt` now properly leaves `<pre>` tags untouched, this regressed in the recent changes to formatting code, sorry!
+- `--syntax-only` (and relative switch in VSCode) now silences also "invalid element name" errors, making it viable to use superhtml with some kinds of templated html
+
+## [v0.6.0]
+- All major Language Server features implemented: completions, clear diagnostics, descriptions, etc.
+- New diagnostics cover element nesting errors and attribute validation, including complex interactions between different attributes and elements.
+- Duplicate ID diagnostics that are `<template>` aware.
+- Rename symbol on a tag name will rename both start and end tags at once.
+- Find references can be used on class names to find other elements that have the same class.
+- New improved autoformatting that keeps the first attribute on the same line as the element:
+   - Uses tabs for indentation and spaces for alignment (experimental, might be reverted)
+   - Respects empty lines that delineate separate blocks.
+   - Doesn't format vertically elements in between text nodes anymore.
+   - Basic CSS and JS autoformatting.
+- Introduced a "Syntax Only Mode" setting to disable advanced validation for compatibility with templated HTML files.
+
+This is a huge jump forward bug reports (with repro instructions!) are appreciated.
+If you believe a diagnostic produced by SuperHTML to be wrong you are welcome to open an issue but
+you will be asked to reference the HTML spec to dissuade poorly researched, drive-by issues.
+
 ## [v0.5.3]
 - Fixes remaining bug when formatting void elements vertically.
  

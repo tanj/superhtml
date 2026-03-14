@@ -9,6 +9,7 @@ const root = @import("../root.zig");
 const Language = root.Language;
 const Span = root.Span;
 const log = std.log.scoped(.attribute);
+const language_tag = @import("language_tag.zig");
 
 rule: Rule,
 desc: []const u8,
@@ -73,6 +74,9 @@ pub const Rule = union(enum) {
 
     /// MIME
     mime,
+
+    /// BCP 47 language tag
+    lang,
 
     /// Not negative integer
     non_neg_int: struct {
@@ -167,8 +171,8 @@ pub const Rule = union(enum) {
             }
 
             switch (list.extra) {
-                .missing, .manual => unreachable,
-                .none => {},
+                .manual => unreachable,
+                .none, .missing => {},
                 .not_empty => if (item.len > 0) return .custom,
                 .missing_or_empty => return if (item.len > 0) .custom else .empty,
                 .custom => {
@@ -247,16 +251,31 @@ pub const Rule = union(enum) {
             .manual => unreachable,
             .any => {},
             .bool => {
-                if (attr.value) |value| {
+                if (attr.value != null) {
                     try errors.append(gpa, .{
                         .tag = .boolean_attr,
-                        .main_location = value.span,
+                        .main_location = attr.name,
                         .node_idx = node_idx,
                     });
                 }
             },
             .mime => return validateMime(gpa, errors, src, node_idx, attr),
             .cors => continue :rule .{ .list = cors_list },
+            .lang => {
+                const value = attr.value orelse return;
+                const value_slice = value.span.slice(src);
+                if (value_slice.len == 0) return;
+                if (language_tag.validate(value_slice)) |rejection| return errors.append(gpa, .{
+                    .tag = .{
+                        .invalid_attr_value = .{ .reason = rejection.reason },
+                    },
+                    .main_location = .{
+                        .start = value.span.start + rejection.offset,
+                        .end = value.span.start + rejection.offset + rejection.length,
+                    },
+                    .node_idx = node_idx,
+                });
+            },
             .not_empty => {
                 const value = attr.value orelse return errors.append(gpa, .{
                     .tag = .missing_attr_value,
@@ -825,6 +844,7 @@ pub const ValidatingIterator = struct {
     it: Tokenizer,
     errors: *std.ArrayListUnmanaged(Ast.Error),
     seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     end: u32,
     node_idx: u32,
     name: Span = undefined,
@@ -833,6 +853,7 @@ pub const ValidatingIterator = struct {
     pub fn init(
         errors: *std.ArrayListUnmanaged(Ast.Error),
         seen_attrs: *std.StringHashMapUnmanaged(Span),
+        seen_ids: *std.StringHashMapUnmanaged(Span),
         lang: Language,
         tag: Span,
         src: []const u8,
@@ -847,11 +868,17 @@ pub const ValidatingIterator = struct {
             },
             .errors = errors,
             .seen_attrs = seen_attrs,
+            .seen_ids = seen_ids,
             .end = tag.end,
             .node_idx = node_idx,
         };
 
-        result.name = result.it.next(src).?.tag_name;
+        // we need to discard potential error tokens because unexpected solidus errors
+        // will be reported before the full name
+        result.name = while (result.it.next(src)) |tok| {
+            if (tok == .tag_name) break tok.tag_name;
+        } else unreachable;
+
         return result;
     }
 
@@ -884,6 +911,18 @@ pub const ValidatingIterator = struct {
                         });
                         continue;
                     } else {
+                        if (std.ascii.eqlIgnoreCase(attr_name, "id")) {
+                            if (attr.value) |v| {
+                                const idgop = try vait.seen_ids.getOrPut(gpa, v.span.slice(src));
+                                if (idgop.found_existing) {
+                                    try vait.errors.append(gpa, .{
+                                        .tag = .{ .duplicate_id = idgop.value_ptr.* },
+                                        .main_location = v.span,
+                                        .node_idx = vait.node_idx,
+                                    });
+                                } else idgop.value_ptr.* = v.span;
+                            }
+                        }
                         gop.value_ptr.* = attr.name;
                         return attr;
                     }
@@ -943,6 +982,9 @@ pub fn completions(
                 switch (attr_model.rule) {
                     .cors => if (value_content.len == 0) {
                         return Rule.cors_list.completions;
+                    },
+                    .lang => {
+                        return language_tag.completions(value_content);
                     },
                     .list => |l| {
                         if (value_content.len == 0) {
@@ -1076,7 +1118,7 @@ const empty_set: *const AttributeSet = &.{
     .map = .initComptime(.{}),
 };
 
-const Named = struct { name: []const u8, model: Attribute };
+pub const Named = struct { name: []const u8, model: Attribute };
 pub const AttributeSet = struct {
     list: []const Named,
     map: Map,
@@ -1117,14 +1159,14 @@ pub const AttributeSet = struct {
 };
 
 pub const element_attrs: std.EnumArray(Ast.Kind, *const AttributeSet) = .init(.{
-    .root = undefined,
-    .doctype = undefined,
-    .comment = undefined,
-    .text = undefined,
+    .root = empty_set,
+    .doctype = empty_set,
+    .comment = empty_set,
+    .text = empty_set,
     .extend = &@import("elements/extend.zig").attributes,
-    .super = undefined,
-    .ctx = undefined,
-    .___ = undefined,
+    .super = empty_set,
+    .ctx = empty_set,
+    .___ = empty_set,
     .a = &@import("elements/a.zig").attributes,
     .abbr = empty_set,
     .address = empty_set,
@@ -1243,14 +1285,12 @@ pub const element_attrs: std.EnumArray(Ast.Kind, *const AttributeSet) = .init(.{
     .wbr = empty_set,
 });
 
-const temp: Attribute = .{
-    .rule = .any,
-    .desc = "#temp global attribute#",
-};
-
 pub fn isData(name: []const u8) bool {
     if (name.len < "data-*".len) return false;
-    return std.ascii.eqlIgnoreCase("data-", name[0.."data-".len]);
+    const data = std.ascii.eqlIgnoreCase("data-", name[0.."data-".len]);
+    // TODO: remove this hack once aria attributes are implemented
+    const aria = std.ascii.eqlIgnoreCase("aria-", name[0.."aria-".len]);
+    return data or aria;
 }
 
 pub const global: AttributeSet = .init(&.{
@@ -1625,7 +1665,7 @@ pub const global: AttributeSet = .init(&.{
     .{
         .name = "lang",
         .model = .{
-            .rule = .not_empty,
+            .rule = .lang,
             .desc = "The `lang` global attribute helps define the language of an element: the language that non-editable elements are written in, or the language that the editable elements should be written in by the user. The attribute contains a single BCP 47 language tag.",
         },
     },
@@ -1656,6 +1696,13 @@ pub const global: AttributeSet = .init(&.{
                     },
                 }),
             },
+        },
+    },
+    .{
+        .name = "role",
+        .model = .{
+            .desc = "The `role` property of the Element interface returns the explicitly set WAI-ARIA role for the element.",
+            .rule = .not_empty, // TODO: make it a list attribute
         },
     },
     .{

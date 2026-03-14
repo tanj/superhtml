@@ -74,19 +74,19 @@ pub const attributes: AttributeSet = .init(&.{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) error{OutOfMemory}!void {
-    var seen_attrs: std.StringHashMapUnmanaged(Span) = .{};
-    defer seen_attrs.deinit(gpa);
-
     // Zero or one legend element followed by zero or more optgroup element inner
     // content elements.
     const parent = nodes[parent_idx];
     var vait: Attribute.ValidatingIterator = .init(
         errors,
-        &seen_attrs,
+        seen_attrs,
+        seen_ids,
         .html,
         parent.open,
         src,
@@ -204,12 +204,7 @@ fn completionsContent(
 
     switch (state) {
         .legend => switch (kind_after_cursor) {
-            .legend => return &.{
-                .{
-                    .label = "legend",
-                    .desc = comptime Element.all.get(.legend).desc,
-                },
-            },
+            .legend => return &.{Element.all_completions.get(.legend)},
             else => return Element.simpleCompletions(
                 arena,
                 &.{.legend},

@@ -36,10 +36,14 @@ pub const html: Element = .{
 pub fn validateContent(
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) !void {
+    _ = seen_attrs;
+    _ = seen_ids;
     var has_head: ?Span = null;
     var has_body: ?Span = null;
 
@@ -50,6 +54,7 @@ pub fn validateContent(
     while (child_idx != 0) {
         const child = nodes[child_idx];
         defer child_idx = child.next_idx;
+        if (child.kind == .comment) continue;
 
         const child_span = child.span(src);
 
@@ -153,8 +158,8 @@ fn completionsContent(
     }
 
     const all: []const Ast.Completion = &.{
-        .{ .label = "head", .desc = comptime Element.all.get(.head).desc },
-        .{ .label = "body", .desc = comptime Element.all.get(.body).desc },
+        comptime Element.all_completions.get(.head),
+        comptime Element.all_completions.get(.body),
     };
 
     if (has_head) {

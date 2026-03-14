@@ -1,9 +1,8 @@
 # SuperHTML
-HTML Language Server and Templating Language Library
+HTML Validator, Formatter, LSP, and Templating Language Library
 
-
-## HTML Language Server
-The Super CLI Tool offers **syntax checking** and **autoformatting** features for HTML files.
+## SuperHTML CLI Tool
+The SuperHTML CLI Tool offers **validation** and **autoformatting** features for HTML files.
 
 The tool can be used either directly (for example by running it on save), or through a LSP client implementation.
 
@@ -12,49 +11,42 @@ $ superhtml
 Usage: superhtml COMMAND [OPTIONS]
 
 Commands:
-  check         Check documents for syntax errors
-  interface, i  Print a SuperHTML template's interface
-  fmt           Format documents
-  lsp           Start the Super LSP
-  help          Show this menu and exit
-  version       Print Super's version and exit
+  check         Check documents for errors.
+  fmt           Format documents.
+  lsp           Start the Language Server.
+  help          Show this menu and exit.
+  version       Print the version and exit.
 
 General Options:
-  --help, -h   Print command specific usage
+  --help, -h        Print command specific usage.
+  --syntax-only     Disable HTML element and attribute validation.
 ```
 
 >[!WARNING]
->SuperHTML currently only supports UTF8-encoded HTML and assumes HTML5 compliance (e.g. doesn't support XHTML, regardless of what you define the doctype to be).
+>SuperHTML only supports HTML5 (the WHATWG living spec) regardless of what you put in your doctype (a warning will be generated for unsupported doctypes).
+
+>[!WARNING]
+>Templated HTML (Jinja2, Angular, Mustache, ...) is not yet supported when all validation rules are enabled, use `--syntax-only` (or the relative Extension Setting in VSCode) to limit validation to syntax errors to use SuperHTML with templated HTML documents.
+>
+> Compatibility with popular templating languages is being explored. 
+
 
 ### Diagnostics
+SuperHTML validates not only syntax but also element nesting and attribute values.
+No other language server implements the full HTML spec in its validation code.
 
-![](.github/vscode.png)
+![](.github/helix.png)
 
-This language server is stricter than the HTML spec whenever it would prevent potential human errors from being reported.
-
-
-As an example, HTML allows for closing some tags implicitly. For example the following snippet is correct HTML.
-
-```html
-<ul>
-  <li> One
-  <li> Two
-</ul>
-```
-
-This will still be reported as an error by SuperHTML because otherwise the following snippet would have to be considered correct (while it's most probably a typo):
-
-```html
-<li>item<li>
-```
 
 ### Autoformatting
-![](.github/vscode-autoformat.gif)
-
 The autoformatter has two main ways of interacting with it in order to request for horizontal / vertical alignment.
 
 1. Adding / removing whitespace between the **start tag** of an element and its content.
 2. Adding / removing whitespace between the **last attribute** of a start tag and the closing  `>`.
+
+
+>[!TIP]
+>Consider using `superhtml fmt --check` in your CI to enforce every change to be performed on normalized HTML files. This is a technique commonly used in Zig (and Go) for source code that can also help streamline frontend development.
 
 
 #### Example of rule #1
@@ -83,45 +75,48 @@ After:
 <div><p>Foo</p></div>
 ```
 
-#### Example of rule #2
+### Example of rule #2
 Before:
 ```html
-<div foo="bar" style="verylongstring" >
+<div foo="bar" style="verylongstring" hidden >
     Foo
 </div>
 ```
 
 After:
 ```html
-<div
-   foo="bar"
-   style="verylongstring"
+<div foo="bar" 
+     style="verylongstring" 
+     hidden
 >
     Foo
 </div>
 ```
 
-##### Reverse
+#### Reverse
 
 Before:
 ```html
-<div
-   foo="bar"
-   style="verylongstring">
+<div foo="bar" 
+     style="verylongstring"
+     hidden>
     Foo
 </div>
 ```
 
 After:
 ```html
-<div foo="bar" style="verylongstring">
+<div foo="bar" style="verylongstring" hidden>
     Foo
 </div>
 ```
 
+### Download
+See the Releases section here on GitHub.
+
 ### Editor support
 #### VSCode
-Install the [Super HTML VSCode extension](https://marketplace.visualstudio.com/items?itemName=LorisCro.super).
+Install the [Super HTML VSCode extension](https://marketplace.visualstudio.com/items?itemName=LorisCro.super) (doesn't require the CLI tool as it bundles a WASM build of the language server).
 
 #### Neovim
 1. Download a prebuilt version of `superhtml` from the Releases section (or build it yourself).
@@ -161,30 +156,15 @@ Install the [Super HTML VSCode extension](https://marketplace.visualstudio.com/i
 		```
 
 #### Helix
-
 In versions later than `24.07` `superhtml` is supported out of the box, simply add executable to your `PATH`.
 
-For `24.07` and earlier, add to your `.config/helix/languages.toml`:
-```toml
-[language-server.superhtml-lsp]
-command = "superhtml"
-args = ["lsp"]
-
-[[language]]
-name = "html"
-scope = "source.html"
-roots = []
-file-types = ["html"]
-language-servers = [ "superhtml-lsp" ]
-```
-See https://helix-editor.com for more information on how to add new language servers.
 
 #### [Flow Control](https://github.com/neurocyte/flow)
 Already defaults to using SuperHTML, just add the executable to your `PATH`.
 
 #### Vim
-Vim should be able to parse the errors that `superhtml check [PATH]`. This
-means that you can use `:make` and the quickfix window to check for syntax
+Vim should be able to parse the errors that `superhtml check [PATH]` generates.
+This means that you can use `:make` and the quickfix window to check for syntax
 errors.
 
 Set the `makeprg` to the following in your .vimrc:
@@ -196,7 +176,6 @@ autocmd filetype html setlocal formatprg=superhtml\ fmt\ --stdin
 ```
 
 #### Zed
-
 See [WeetHet/superhtml-zed](https://github.com/WeetHet/superhtml-zed).
 
 #### Other editors
@@ -204,11 +183,85 @@ Follow your editor specific instructions on how to define a new Language Server 
 
 *(Also feel free to contribute more specific instructions to this readme / add files under the `editors/` subdirectory).*
 
+
+## FAQs
+### Why doesn't SuperHTML support self-closing tags?
+Because self-closing tags don't exist in HTML and, while harmless when used with void elements, it just keeps misleating people into thinking that you can self-close HTML tags.
+
+In particular, given this HTML code:
+
+```html
+<!doctype html>
+<html> 
+  <head></head>
+  <body>
+    <div/>
+    <p></p>
+  </body>
+</html>
+```
+
+You might think that `<div>` and `<p>` are siblings, while in reality browsers are required **by the spec** to ignore the self-closing slash in `<div/>`, making `<p>` a child, not a sibling of it.
+
+Add to that the fact that tooling like the default HTML formatter in VSCode will provide misleading autoformatting (try it yourself, disable SuperHTML in VSCode and autoformat the snippet above), to this day people are way more confused about HTML than they need to be.
+
+Related: [#100](https://github.com/kristoff-it/superhtml/pull/100).
+
+### Why doesn't SuperHTML report duplicate values in `[class]` as an error?
+The HTML spec defines the global `class` attribute as a space-separated list of tokens, as opposed to a space-separated list of *unique* tokens, like some other attributes are (e.g. `accesskey`).
+
+### Why is `<style>` under `<body>` an error? It works in all browsers!
+As far as I'm concerned, there is no good reason to forbid `<style>` in body, but that's what the HTML spec does.
+
+Related upstream issue: https://github.com/whatwg/html/issues/1605
+
+### Why does SuperHTML consider unclosed `<li>` elements an error?
+
+According to the HTML spec it's legal to leave some tags unclosed.
+One common example is `<li>`, which enables this usage pattern:
+
+```html
+<ul>
+  <li> First point
+  <li> Second point
+</ul>	
+```
+
+The reason why this is not ambiguous is that `<li>`cannot be nested inside
+another `<li>` so whe the second sibling is encountered, it's possible to always
+correctly implicitly close the first `<li>`.
+
+SuperHTML breaks compatibility with the HTML spec in this regard for one main reason:
+while implicitly closed tags are unambiguous in *valid* HTML documents, it creates a
+problematic gray area when it comes to typos.
+
+Consider the following snippet:
+
+```html
+<li>first point<li>
+```
+
+If SuperHTML were to follow the HTML spec it would have to consider this valid
+HTML that represents two bullet points, the second of which contains no content.
+
+Unfortunately it's also very likely (acutally even more so) that the user just
+forgot the closing slash in the second tag.
+
+For this reason SuperHTML does not allow closing tags implicitly even if the
+HTML spec allows it.
+
+If you want to write HTML code that leverages this feature, do not use SuperHTML
+as there are no plans to ever support it.
+
+#### But what about Google AMP?
+Why are you letting an ad company decide what the world wide web should look like.
+Do you want ads? Because that's how you get ads.
+
 ## Templating Language Library
 SuperHTML is also a HTML templating language. More on that soon.
 
 ## Contributing
-SuperHTML tracks the latest Zig release (0.13.0 at the moment of writing).
+SuperHTML tracks the latest Zig release (0.15.1 at the moment of writing).
 
 ### Contributing to the HTML parser & LSP
 Contributing to the HTML parser and LSP doesn't require you to be familiar with the templating language, basically limiting the scope of what you have to worry about to:
@@ -217,10 +270,15 @@ Contributing to the HTML parser and LSP doesn't require you to be familiar with 
 - `src/cli/`
 - `src/html/`
 
-In particular, you will care about `src/html/Tokenizer.zig` and `src/html/Ast.zig`.
+In particular, you will care about the source files under `src/html`.
 
-You can run `zig test src/html/Ast.zig` to run parser unit tests without needing to worry the rest of the project.
+You can invoke `zig build test` to run all unit tests.
 
-Running `zig build` will compile the Super CLI tool, allowing you to also then test the LSP behavior directly from your favorite editor.
+Running `zig build` will compile the SuperHTML CLI tool, allowing you to also then test the LSP behavior directly from your favorite editor.
 
-The LSP will log in your cache directory so you can `tail -f ~/.cache/super/super.log` to see what happens with the LSP.
+For testing within VSCode:
+1. Run `zig build wasm -p src/editors/vscode/wasm`
+2. Open `src/editors/vscode` in VSCode
+3. Start debugging.
+
+Debug builds will produce logs in your cache directory so you can `tail -f ~/.cache/superhtml.log`.

@@ -67,6 +67,8 @@ content: union(enum) {
         validate: *const fn (
             gpa: Allocator,
             nodes: []const Ast.Node,
+            seen_attrs: *std.StringHashMapUnmanaged(Span),
+            seen_ids: *std.StringHashMapUnmanaged(Span),
             errors: *std.ArrayListUnmanaged(Ast.Error),
             src: []const u8,
             parent_idx: u32,
@@ -279,13 +281,17 @@ pub inline fn modelRejects(
             if (!element.model.content.overlaps(descendant_rt_model.categories)) {
                 return .{
                     .reason = "",
-                    .span = ancestor.startTagIterator(src, .html).name_span,
+                    .span = ancestor.span(src),
                 };
             }
         }
 
-        log.debug("REACHED UNREACHABLE in modeleRejects", .{});
-        unreachable;
+        // if we reach here it means that we have transparent elements at the
+        // top level of our tree.
+        return .{
+            .reason = "",
+            .span = parent_span,
+        };
     }
 
     if (parent_element.meta.content_reject.overlaps(descendant_rt_model.categories)) {
@@ -322,13 +328,23 @@ pub inline fn validateContent(
     parent_element: *const Element,
     gpa: Allocator,
     nodes: []const Ast.Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     errors: *std.ArrayListUnmanaged(Ast.Error),
     src: []const u8,
     parent_idx: u32,
 ) !void {
     content: switch (parent_element.content) {
         .anything => {},
-        .custom => |custom| try custom.validate(gpa, nodes, errors, src, parent_idx),
+        .custom => |custom| try custom.validate(
+            gpa,
+            nodes,
+            seen_attrs,
+            seen_ids,
+            errors,
+            src,
+            parent_idx,
+        ),
         .model => continue :content .{ .simple = .{} },
         .simple => |simple| {
             const parent = nodes[parent_idx];
@@ -345,6 +361,8 @@ pub inline fn validateContent(
                 switch (child.kind) {
                     else => {},
                     .doctype => continue,
+                    .comment => continue,
+                    .___ => continue,
                     .text => {
                         if (!parent.model.content.flow and
                             !parent.model.content.phrasing and
@@ -379,7 +397,7 @@ pub inline fn validateContent(
                                     .span = parent_span,
                                 },
                             },
-                            .main_location = child.startTagIterator(src, .html).name_span,
+                            .main_location = child.span(src),
                             .node_idx = child_idx,
                         });
                         continue :outer;
@@ -401,7 +419,7 @@ pub inline fn validateContent(
                                 .reason = rejection.reason,
                             },
                         },
-                        .main_location = child.startTagIterator(src, .html).name_span,
+                        .main_location = child.span(src),
                         .node_idx = child_idx,
                     });
                 }
@@ -444,7 +462,7 @@ pub inline fn validateContent(
                                     .span = parent_span,
                                 },
                             },
-                            .main_location = node.startTagIterator(src, .html).name_span,
+                            .main_location = node.span(src),
                             .node_idx = node_idx,
                         });
                         continue :outer;
@@ -461,7 +479,7 @@ pub inline fn validateContent(
                                 .reason = "presence of [tabindex]",
                             },
                         },
-                        .main_location = node.startTagIterator(src, .html).name_span,
+                        .main_location = node.span(src),
                         .node_idx = node_idx,
                     });
                     continue :outer;
@@ -477,6 +495,7 @@ pub inline fn validateAttrs(
     lang: Language,
     errors: *std.ArrayListUnmanaged(Error),
     seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids: *std.StringHashMapUnmanaged(Span),
     nodes: []const Ast.Node,
     parent_idx: u32,
     src: []const u8,
@@ -486,6 +505,7 @@ pub inline fn validateAttrs(
     var vait: Attribute.ValidatingIterator = .init(
         errors,
         seen_attrs,
+        seen_ids,
         lang,
         tag,
         src,
@@ -494,7 +514,15 @@ pub inline fn validateAttrs(
 
     return switch (element.attributes) {
         .manual => return element.model,
-        .dynamic => |validate| validate(gpa, errors, src, nodes, parent_idx, node_idx, &vait),
+        .dynamic => |validate| validate(
+            gpa,
+            errors,
+            src,
+            nodes,
+            parent_idx,
+            node_idx,
+            &vait,
+        ),
         .static => blk: {
             // const max_len = comptime max: {
             //     var max: u32 = 0;
@@ -563,36 +591,72 @@ pub inline fn completions(
                 offset,
             );
         },
-        .content => content: switch (element.content) {
-            .custom => |custom| return custom.completions(
-                arena,
-                ast,
-                src,
-                node_idx,
-                offset,
-            ),
-            .model => continue :content .{ .simple = .{} },
-            .simple => |simple| return simpleCompletions(
-                arena,
-                &.{},
-                ast.nodes[node_idx].model.content,
-                element.meta.content_reject,
-                simple,
-            ),
-            .anything => {
-                const start: usize = @intFromEnum(Kind.___) + 1;
-                const all_elems = all.values[start..];
-                const anything: [all_elems.len]Ast.Completion = comptime blk: {
-                    var anything: [all_elems.len]Ast.Completion = undefined;
-                    for (all_elems, &anything) |in, *out| out.* = .{
-                        .label = @tagName(in.tag),
-                        .desc = in.desc,
-                    };
-                    break :blk anything;
-                };
+        .content => {
+            const children = content: switch (element.content) {
+                .custom => |custom| try custom.completions(
+                    arena,
+                    ast,
+                    src,
+                    node_idx,
+                    offset,
+                ),
+                .model => continue :content .{ .simple = .{} },
+                .simple => |simple| try simpleCompletions(
+                    arena,
+                    &.{},
+                    ast.nodes[node_idx].model.content,
+                    element.meta.content_reject,
+                    simple,
+                ),
+                .anything => {
+                    // const start: usize = @intFromEnum(Kind.___) + 1;
+                    // const all_elems = all.values[start..];
+                    // const anything: [all_elems.len]Ast.Completion = comptime a: {
+                    //     var anything: [all_elems.len]Ast.Completion = undefined;
+                    //     for (all_elems, &anything) |in, *out| out.* = .{
+                    //         .label = @tagName(in.tag),
+                    //         .desc = in.desc,
+                    //     };
+                    //     break :a anything;
+                    // };
 
-                return &anything;
-            },
+                    // break :content &anything;
+                    break :content all_completions.values[8..];
+                },
+            };
+
+            var result: std.ArrayList(Ast.Completion) = .empty;
+
+            var ancestor_idx = node_idx;
+            while (ancestor_idx != 0) {
+                const ancestor = ast.nodes[ancestor_idx];
+                if (!ancestor.isClosed()) {
+                    const name = ancestor.span(src).slice(src);
+                    log.debug("open ancestor = {any}, open = '{s}'\n", .{ ancestor, name });
+                    const slashed = try std.fmt.allocPrint(arena, "/{s}>", .{name});
+                    var idx = offset;
+                    const has_slash: u32 = @intFromBool(src[offset -| 1] == '/');
+                    const has_closing_bracket: u32 = while (idx < src.len) : (idx += 1) {
+                        switch (src[idx]) {
+                            else => {},
+                            '\n' => break 0,
+                            '>' => break 1,
+                        }
+                    } else 1;
+                    try result.append(arena, .{
+                        .label = slashed[0 .. slashed.len - 1],
+                        .value = slashed[has_slash .. slashed.len - has_closing_bracket],
+                        .desc = "Close the last open element.",
+                        .kind = .element_close,
+                    });
+                    break;
+                }
+                ancestor_idx = ancestor.parent_idx;
+            }
+
+            try result.ensureTotalCapacityPrecise(arena, result.items.len + children.len);
+            result.appendSliceAssumeCapacity(children);
+            return result.items;
         },
     }
 }
@@ -610,10 +674,7 @@ pub fn simpleCompletions(
         all.values.len - @intFromEnum(Kind.___),
     );
 
-    for (prefix) |p| list.appendAssumeCapacity(.{
-        .label = @tagName(p),
-        .desc = all.get(p).desc,
-    });
+    for (prefix) |p| list.appendAssumeCapacity(all_completions.get(p));
 
     const start: usize = @intFromEnum(Kind.___) + 1;
     outer: for (all.values[start..], start..) |e, idx| {
@@ -635,19 +696,13 @@ pub fn simpleCompletions(
 
         const child_cs = e.meta.categories_superset;
         if (parent_content.overlaps(child_cs)) {
-            list.appendAssumeCapacity(.{
-                .label = @tagName(child_kind),
-                .desc = e.desc,
-            });
+            list.appendAssumeCapacity(all_completions.get(child_kind));
             continue :outer;
         }
 
         for (simple.extra_children) |ec| {
             if (ec == child_kind) {
-                list.appendAssumeCapacity(.{
-                    .label = @tagName(child_kind),
-                    .desc = e.desc,
-                });
+                list.appendAssumeCapacity(all_completions.get(child_kind));
                 continue :outer;
             }
         }
@@ -675,39 +730,52 @@ pub const elements: KindMap = blk: {
     break :blk .initComptime(keys);
 };
 
-const temp: Element = .{
-    .tag = .div,
-    .model = .{
-        .categories = .{
-            .flow = true,
-            .phrasing = true,
-        },
-        .content = .all,
-    },
-    .meta = .{
-        .categories_superset = .{
-            .flow = true,
-            .phrasing = true,
-        },
-        .content_reject = .none,
-        .extra_reject = .none,
-    },
-    .attributes = .static,
-    .content = .{
-        .simple = .{},
-    },
-    .desc = "#temporary element description#",
+pub const all_completions = blk: {
+    var ac: std.EnumArray(Ast.Kind, Ast.Completion) = undefined;
+
+    const fields = std.meta.fields(Ast.Kind)[8..];
+    assert(std.mem.eql(u8, fields[0].name, "a"));
+    for (ac.values[8..], fields, all.values[8..]) |*completion, f, elem| {
+        completion.* = .{
+            .label = f.name,
+            .value = if (@field(Ast.Kind, f.name).isVoid())
+                f.name ++ "$1>"
+            else
+                f.name ++ "$1>$0</" ++ f.name ++ ">",
+            .desc = elem.desc,
+            .kind = .element_open,
+        };
+    }
+    break :blk ac;
 };
 
 pub const all: std.EnumArray(Ast.Kind, Element) = .init(.{
     .root = @import("elements/root.zig").root,
-    .doctype = undefined,
-    .comment = undefined,
-    .text = temp,
-    .extend = @import("elements/extend.zig").extend, // done
-    .super = temp,
-    .ctx = temp,
-    .___ = temp,
+    .doctype = @import("elements/doctype.zig").doctype,
+    .comment = @import("elements/comment.zig").comment,
+    .text = @import("elements/text.zig").text,
+    .extend = @import("elements/extend.zig").extend,
+    .super = @import("elements/super.zig").super,
+    .ctx = @import("elements/ctx.zig").ctx,
+    .___ = .{
+        .tag = .___,
+        .model = .{
+            .categories = .{
+                .flow = true,
+                .phrasing = true,
+            },
+            .content = .all,
+        },
+        .meta = .{
+            .categories_superset = .{
+                .flow = true,
+                .phrasing = true,
+            },
+        },
+        .attributes = .static,
+        .content = .model,
+        .desc = "Unknown element.",
+    },
     .a = @import("elements/a.zig").a, // done
     .abbr = @import("elements/abbr.zig").abbr, // done
     .address = @import("elements/address.zig").address, // done

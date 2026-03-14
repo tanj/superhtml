@@ -1,5 +1,6 @@
 const Ast = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -15,6 +16,8 @@ const kinds = Element.elements;
 const Attribute = @import("Attribute.zig");
 
 const log = std.log.scoped(.@"html/ast");
+const fmtlog = std.log.scoped(.@"html/ast/fmt");
+const cpllog = std.log.scoped(.@"html/ast/completions");
 
 has_syntax_errors: bool,
 language: Language,
@@ -143,7 +146,7 @@ pub const Node = struct {
     next_idx: u32 = 0,
 
     kind: Kind,
-    self_closing: bool = false, // TODO fold into element tags
+    self_closing: bool,
     model: Element.Model,
 
     pub fn isClosed(n: Node) bool {
@@ -278,6 +281,7 @@ pub const Error = struct {
         void_end_tag,
         duplicate_attribute_name: Span, // original attribute
         duplicate_sibling_attr: Span, // original attribute in another element
+        duplicate_id: Span, // original location
         deprecated_and_unsupported,
 
         const Tag = @This();
@@ -289,7 +293,7 @@ pub const Error = struct {
             src: []const u8,
             pub fn format(tf: Tag.Formatter, w: *std.Io.Writer) !void {
                 return switch (tf.tag) {
-                    .token => w.print("syntax error", .{}),
+                    .token => |terr| try w.print("syntax error: {t}", .{terr}),
                     .unsupported_doctype => w.print(
                         "unsupported doctype: superhtml only supports the 'html' doctype",
                         .{},
@@ -341,7 +345,7 @@ pub const Error = struct {
                             .first_or_last => "first or last",
                         }},
                     ),
-                    .missing_ancestor => |e| w.print("missing ancestor: {t}", .{e}),
+                    .missing_ancestor => |e| w.print("missing ancestor: <{t}>", .{e}),
                     .missing_child => |e| w.print("missing child: <{t}>", .{e}),
                     .duplicate_child => |dc| {
                         try w.print("duplicate child", .{});
@@ -377,6 +381,10 @@ pub const Error = struct {
                     .duplicate_attribute_name => w.print("duplicate attribute name", .{}),
                     .duplicate_sibling_attr => w.print(
                         "duplicate attribute name across sibling elements",
+                        .{},
+                    ),
+                    .duplicate_id => w.print(
+                        "duplicate id value",
                         .{},
                     ),
                     .deprecated_and_unsupported => w.print("deprecated and unsupported", .{}),
@@ -415,8 +423,10 @@ fn printSourceLine(src: []const u8, span: Span, w: *Writer) !void {
     // test.html:3:7: invalid attribute for this element
     //         <div foo bar baz>
     //              ^^^
-    //
-    var idx = span.start;
+
+    // If the error starts on a newline (eg `foo="bar\n`), we want to consider
+    // it ast part of the previous line.
+    var idx = span.start -| 1;
     var spaces_left: u32 = 0;
     const line_start = while (idx > 0) : (idx -= 1) switch (src[idx]) {
         '\n' => break idx + 1,
@@ -425,7 +435,7 @@ fn printSourceLine(src: []const u8, span: Span, w: *Writer) !void {
     } else 0;
 
     idx = span.start;
-    var last_non_space = idx;
+    var last_non_space = idx -| 1; // if span.start is a newline don't print it
     while (idx < src.len) : (idx += 1) switch (src[idx]) {
         '\n' => break,
         ' ', '\t', ('\n' + 1)...'\r' => {},
@@ -435,7 +445,7 @@ fn printSourceLine(src: []const u8, span: Span, w: *Writer) !void {
     const line = src[line_start + spaces_left .. last_non_space + 1];
     try w.print("   {s}\n", .{line});
     try w.splatByteAll(' ', span.start - (line_start + spaces_left) + 3);
-    try w.splatByteAll('^', span.end - span.start);
+    try w.splatByteAll('^', @max(1, span.end - span.start));
     try w.print("\n", .{});
 }
 
@@ -448,10 +458,9 @@ pub fn init(
     gpa: Allocator,
     src: []const u8,
     language: Language,
-    /// When true only official HTML tag names will be allowed.
-    /// Strict mode currently only supports HTML and SuperHTML.
-    strict: bool,
+    syntax_only: bool,
 ) error{OutOfMemory}!Ast {
+    log.debug("INIT ---- syntax only: {}", .{syntax_only});
     if (src.len > std.math.maxInt(u32)) @panic("too long");
 
     var nodes = std.array_list.Managed(Node).init(gpa);
@@ -462,6 +471,14 @@ pub fn init(
 
     var seen_attrs: std.StringHashMapUnmanaged(Span) = .empty;
     defer seen_attrs.deinit(gpa);
+
+    // It's a stack because of <template> (which can also be nested)
+    var seen_ids_stack: std.ArrayList(std.StringHashMapUnmanaged(Span)) = .empty;
+    try seen_ids_stack.append(gpa, .empty);
+    defer {
+        for (seen_ids_stack.items) |*seen_ids| seen_ids.deinit(gpa);
+        seen_ids_stack.deinit(gpa);
+    }
 
     var has_syntax_errors = false;
 
@@ -483,6 +500,7 @@ pub fn init(
             .categories = .none,
             .content = .all,
         },
+        .self_closing = false,
     });
 
     var tokenizer: Tokenizer = .{ .language = language };
@@ -507,6 +525,7 @@ pub fn init(
                         .categories = .none,
                         .content = .none,
                     },
+                    .self_closing = false,
                 };
 
                 switch (current.direction()) {
@@ -531,6 +550,7 @@ pub fn init(
                 .start_self,
                 => {
                     const name = tag.name.slice(src);
+                    const self_closing = tag.kind == .start_self;
                     var new: Node = node: switch (tag.kind) {
                         else => unreachable,
                         .start_self => {
@@ -570,39 +590,51 @@ pub fn init(
                                         .categories = .all,
                                         .content = .all,
                                     },
+                                    .self_closing = self_closing,
                                 };
                             },
                             .html => {
-                                if (kinds.get(name)) |kind| {
-                                    const parent_idx = switch (current.direction()) {
-                                        .in => current_idx,
-                                        .after => nodes.items[current_idx].parent_idx,
-                                    };
+                                if (svg_lvl == 0 and math_lvl == 0) {
+                                    if (kinds.get(name)) |kind| {
+                                        const parent_idx = switch (current.direction()) {
+                                            .in => current_idx,
+                                            .after => nodes.items[current_idx].parent_idx,
+                                        };
 
-                                    const e = elements.get(kind);
-                                    const model = try e.validateAttrs(
-                                        gpa,
-                                        language,
-                                        &errors,
-                                        &seen_attrs,
-                                        nodes.items,
-                                        parent_idx,
-                                        src,
-                                        tag.span,
-                                        @intCast(nodes.items.len),
-                                    );
+                                        const e = elements.get(kind);
+                                        const model = if (syntax_only or language != .html)
+                                            undefined
+                                        else
+                                            try e.validateAttrs(
+                                                gpa,
+                                                language,
+                                                &errors,
+                                                &seen_attrs,
+                                                &seen_ids_stack.items[seen_ids_stack.items.len - 1],
+                                                nodes.items,
+                                                parent_idx,
+                                                src,
+                                                tag.span,
+                                                @intCast(nodes.items.len),
+                                            );
 
-                                    break :node .{
-                                        .open = tag.span,
-                                        .kind = kind,
-                                        .model = model,
-                                    };
-                                } else if (std.mem.indexOfScalar(u8, name, '-') == null) {
-                                    try errors.append(gpa, .{
-                                        .tag = .invalid_html_tag_name,
-                                        .main_location = tag.name,
-                                        .node_idx = @intCast(nodes.items.len),
-                                    });
+                                        if (kind == .template) {
+                                            try seen_ids_stack.append(gpa, .empty);
+                                        }
+
+                                        break :node .{
+                                            .open = tag.span,
+                                            .kind = kind,
+                                            .model = model,
+                                            .self_closing = self_closing,
+                                        };
+                                    } else if (std.mem.indexOfScalar(u8, name, '-') == null and !syntax_only) {
+                                        try errors.append(gpa, .{
+                                            .tag = .invalid_html_tag_name,
+                                            .main_location = tag.name,
+                                            .node_idx = @intCast(nodes.items.len),
+                                        });
+                                    }
                                 }
 
                                 break :node .{
@@ -612,6 +644,7 @@ pub fn init(
                                         .categories = .all,
                                         .content = .all,
                                     },
+                                    .self_closing = self_closing,
                                 };
                             },
                             .xml => break :node .{
@@ -621,6 +654,7 @@ pub fn init(
                                     .categories = .all,
                                     .content = .all,
                                 },
+                                .self_closing = self_closing,
                             },
                         },
                     };
@@ -652,7 +686,7 @@ pub fn init(
                     try nodes.append(new);
                     current = &nodes.items[current_idx];
 
-                    if (strict and current.kind == .main) {
+                    if (!syntax_only and current.kind == .main) {
                         var ancestor_idx = current.parent_idx;
                         while (ancestor_idx != 0) {
                             const ancestor = nodes.items[ancestor_idx];
@@ -718,17 +752,21 @@ pub fn init(
                         current = &nodes.items[current.parent_idx];
                     }
 
-                    const end_kind = switch (language) {
-                        // .superhtml => {
-                        // if (elements.get(name)) |element| {
-                        //     break :node .{
-                        //         .kind = element.tag,
-                        //         .content = .all,
-                        //         .open = tag.span,
-                        //     };
-                        // } else continue :lang .html;
-                        // },
-                        .html, .superhtml => kinds.get(tag.name.slice(src)) orelse .___,
+                    const name = tag.name.slice(src);
+                    const end_kind = if (svg_lvl == 1 and std.ascii.eqlIgnoreCase(name, "svg"))
+                        .svg
+                    else if (math_lvl == 1 and std.ascii.eqlIgnoreCase(name, "math"))
+                        .math
+                    else if (svg_lvl != 0 or math_lvl != 0) .___ else switch (language) {
+                        .superhtml => if (std.ascii.eqlIgnoreCase("ctx", name))
+                            .ctx
+                        else if (std.ascii.eqlIgnoreCase("super", name))
+                            .super
+                        else if (std.ascii.eqlIgnoreCase("extend", name))
+                            .extend
+                        else
+                            kinds.get(name) orelse .___,
+                        .html => kinds.get(name) orelse .___,
                         .xml => .___,
                     };
 
@@ -788,7 +826,13 @@ pub fn init(
                             if (std.ascii.eqlIgnoreCase(current_name, "math")) {
                                 math_lvl -= 1;
                             }
+                            if (current.kind == .template) {
+                                var map = seen_ids_stack.pop().?;
+                                map.deinit(gpa);
+                            }
+
                             current.close = tag.span;
+
                             var cur = original_current;
                             while (cur != current) {
                                 if (!cur.isClosed()) {
@@ -840,6 +884,7 @@ pub fn init(
                         },
                         .content = .none,
                     },
+                    .self_closing = false,
                 };
 
                 switch (current.direction()) {
@@ -870,6 +915,7 @@ pub fn init(
                         .categories = .all,
                         .content = .none,
                     },
+                    .self_closing = false,
                 };
 
                 log.debug("comment => current ({any})", .{current.*});
@@ -913,6 +959,7 @@ pub fn init(
     // finalize tree
     while (current.kind != .root) {
         if (!current.isClosed()) {
+            has_syntax_errors = true;
             try errors.append(gpa, .{
                 .tag = .missing_end_tag,
                 .main_location = current.open,
@@ -924,9 +971,11 @@ pub fn init(
         current = &nodes.items[current.parent_idx];
     }
 
-    if (strict and !has_syntax_errors and language == .html) try validateNesting(
+    if (!syntax_only and !has_syntax_errors and language == .html) try validateNesting(
         gpa,
         nodes.items,
+        &seen_attrs,
+        &seen_ids_stack,
         &errors,
         src,
         language,
@@ -949,34 +998,40 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
     var current = ast.nodes[1];
     var direction: enum { enter, exit } = .enter;
     var last_rbracket: u32 = 0;
+    var last_was_text = false;
     var pre: u32 = 0;
     while (true) {
         const zone_outer = tracy.trace(@src());
         defer zone_outer.end();
-        log.debug("looping, ind: {}, dir: {s}", .{
+        fmtlog.debug("looping, ind: {}, dir: {s}", .{
             indentation,
             @tagName(direction),
         });
+
+        const crt = current;
+        defer last_was_text = crt.kind == .text;
         switch (direction) {
             .enter => {
                 const zone = tracy.trace(@src());
                 defer zone.end();
-                log.debug("rendering enter ({}): {s} {any}", .{
+                fmtlog.debug("rendering enter ({}): {t} lwt: {}", .{
                     indentation,
-                    "",
-                    // current.open.slice(src),
-                    current,
+                    current.kind,
+                    last_was_text,
                 });
 
                 const maybe_ws = src[last_rbracket..current.open.start];
-                log.debug("maybe_ws = '{s}'", .{maybe_ws});
+                fmtlog.debug("maybe_ws = '{s}'", .{maybe_ws});
                 if (pre > 0) {
                     try w.writeAll(maybe_ws);
                 } else {
-                    const vertical = maybe_ws.len > 0;
+                    const vertical = if (last_was_text and current.kind != .text)
+                        std.mem.indexOfScalar(u8, maybe_ws, '\n') != null
+                    else
+                        maybe_ws.len > 0;
 
                     if (vertical) {
-                        log.debug("adding a newline", .{});
+                        fmtlog.debug("adding a newline", .{});
                         const lines = std.mem.count(u8, maybe_ws, "\n");
                         if (last_rbracket > 0) {
                             if (lines >= 2) {
@@ -989,12 +1044,19 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                         for (0..indentation) |_| {
                             try w.writeAll("\t");
                         }
+                    } else if ((last_was_text or current.kind == .text) and maybe_ws.len > 0) {
+                        try w.writeAll(" ");
                     }
                 }
 
+                const child_is_vertical = if (ast.child(current)) |c|
+                    (c.kind == .text or c.open.start - current.open.end > 0)
+                else
+                    false;
                 if (!current.self_closing and
                     current.kind.isElement() and
-                    !current.kind.isVoid())
+                    !current.kind.isVoid() and
+                    child_is_vertical)
                 {
                     indentation += 1;
                 }
@@ -1011,25 +1073,43 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                     return;
                 }
 
-                log.debug("rendering exit ({}): {s} {any}", .{
+                fmtlog.debug("rendering exit ({}): {s} {any}", .{
                     indentation,
                     current.open.slice(src),
                     current,
                 });
 
+                const child_was_vertical = if (ast.child(current)) |c|
+                    (c.kind == .text or c.open.start - current.open.end > 0)
+                else
+                    false;
                 if (!current.self_closing and
                     current.kind.isElement() and
-                    !current.kind.isVoid())
+                    !current.kind.isVoid() and
+                    child_was_vertical)
                 {
                     indentation -= 1;
                 }
-
-                const open_was_vertical = std.ascii.isWhitespace(src[current.open.end]);
 
                 if (pre > 0) {
                     const maybe_ws = src[last_rbracket..current.close.start];
                     try w.writeAll(maybe_ws);
                 } else {
+                    // const first_child_is_text = if (ast.child(current)) |ch|
+                    //     ch.kind == .text
+                    // else
+                    //     false;
+                    // const open_was_vertical = if (first_child_is_text)
+                    //     std.mem.indexOfScalar(
+                    //         u8,
+                    //         src[current.open.end..ast.nodes[current.first_child_idx].open.start],
+                    //         '\n',
+                    //     ) != null
+                    // else
+                    // std.ascii.isWhitespace(src[current.open.end]);
+
+                    const open_was_vertical = current.open.end < src.len and
+                        std.ascii.isWhitespace(src[current.open.end]);
                     if (open_was_vertical) {
                         try w.writeAll("\n");
                         for (0..indentation) |_| {
@@ -1059,7 +1139,33 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                 const txt = current.open.slice(src);
                 const parent_kind = ast.nodes[current.parent_idx].kind;
                 switch (parent_kind) {
-                    else => try w.writeAll(txt),
+                    else => blk: {
+                        if (pre > 0) {
+                            try w.writeAll(txt);
+                            break :blk;
+                        }
+                        var it = std.mem.splitScalar(u8, txt, '\n');
+                        var first = true;
+                        var empty_line = false;
+                        while (it.next()) |raw_line| {
+                            const line = std.mem.trim(
+                                u8,
+                                raw_line,
+                                &std.ascii.whitespace,
+                            );
+                            if (line.len == 0) {
+                                if (empty_line) continue;
+                                empty_line = true;
+                                if (!first) for (0..indentation) |_| try w.print("\t", .{});
+                                try w.print("\n", .{});
+                                continue;
+                            } else empty_line = false;
+                            if (!first) for (0..indentation) |_| try w.print("\t", .{});
+                            try w.print("{s}", .{line});
+                            if (it.peek() != null) try w.print("\n", .{});
+                            first = false;
+                        }
+                    },
                     .style, .script => {
                         var css_indent = indentation;
                         var it = std.mem.splitScalar(u8, txt, '\n');
@@ -1100,7 +1206,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                 last_rbracket = current.open.end;
 
                 if (current.next_idx != 0) {
-                    log.debug("text next: {}", .{current.next_idx});
+                    fmtlog.debug("text next: {}", .{current.next_idx});
                     current = ast.nodes[current.next_idx];
                 } else {
                     current = ast.nodes[current.parent_idx];
@@ -1131,7 +1237,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                 const maybe_name, const maybe_extra = blk: {
                     var tt: Tokenizer = .{ .language = ast.language };
                     const tag = current.open.slice(src);
-                    log.debug("doctype tag: {s} {any}", .{ tag, current });
+                    fmtlog.debug("doctype tag: {s} {any}", .{ tag, current });
                     const dt = tt.next(tag).?.doctype;
                     const maybe_name: ?[]const u8 = if (dt.name) |name|
                         name.slice(tag)
@@ -1174,7 +1280,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                     var sti = current.startTagIterator(src, ast.language);
                     const name = sti.name_span.slice(src);
 
-                    if (current.kind == .pre) {
+                    if (current.kind == .pre and !current.self_closing) {
                         pre += 1;
                     }
 
@@ -1193,11 +1299,15 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                         break :blk true;
                     };
 
-                    log.debug("element <{s}> vertical = {}", .{ name, vertical });
+                    fmtlog.debug("element <{s}> vertical = {}", .{ name, vertical });
 
                     // if (std.mem.eql(u8, name, "path")) @breakpoint();
 
-                    const attr_indent = indentation - @intFromBool(!current.kind.isVoid() and !current.self_closing);
+                    const child_is_vertical = if (ast.child(current)) |c|
+                        (c.kind == .text or c.open.start - current.open.end > 0)
+                    else
+                        false;
+                    const attr_indent = indentation - @intFromBool(!current.kind.isVoid() and !current.self_closing and child_is_vertical);
                     const extra = blk: {
                         if (current.kind == .doctype) break :blk 1;
                         assert(current.kind.isElement());
@@ -1245,7 +1355,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                         }
                     }
 
-                    if (current.self_closing) {
+                    if (current.self_closing and !current.kind.isVoid()) {
                         try w.print("/", .{});
                     }
                     try w.print(">", .{});
@@ -1280,7 +1390,7 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
                                 .return_attrs = true,
                             };
                             const tag = current.open.slice(src);
-                            log.debug("retokenize {s}\n", .{tag});
+                            fmtlog.debug("retokenize {s}\n", .{tag});
                             break :blk tt.getName(tag).?.slice(tag);
                         };
 
@@ -1305,6 +1415,8 @@ pub fn render(ast: Ast, src: []const u8, w: *Writer) !void {
 pub fn validateNesting(
     gpa: Allocator,
     nodes: []const Node,
+    seen_attrs: *std.StringHashMapUnmanaged(Span),
+    seen_ids_stack: *std.ArrayList(std.StringHashMapUnmanaged(Span)),
     errors: *std.ArrayListUnmanaged(Error),
     src: []const u8,
     language: Language,
@@ -1351,15 +1463,34 @@ pub fn validateNesting(
             else => {},
         }
 
-        defer node_idx += 1;
         const element: Element = elements.get(n.kind);
         try element.validateContent(
             gpa,
             nodes,
+            seen_attrs,
+            &seen_ids_stack.items[seen_ids_stack.items.len - 1],
             errors,
             src,
             node_idx,
         );
+
+        if (n.kind == .template) try seen_ids_stack.append(gpa, .empty);
+
+        if (n.first_child_idx != 0) {
+            node_idx = n.first_child_idx;
+            continue;
+        }
+
+        var next = n;
+        node_idx = while (true) {
+            if (next.kind == .template) {
+                var map = seen_ids_stack.pop().?;
+                map.deinit(gpa);
+            }
+            if (next.next_idx != 0) break next.next_idx;
+            if (next.parent_idx == 0) return;
+            next = nodes[next.parent_idx];
+        };
     }
 }
 
@@ -1367,6 +1498,9 @@ pub const Completion = struct {
     label: []const u8,
     desc: []const u8,
     value: ?[]const u8 = null,
+    // This value is used by the lsp to know how to interpret
+    // the value field of this list of suggestions.
+    kind: enum { attribute, element_open, element_close } = .attribute,
 };
 
 pub fn completions(
@@ -1376,7 +1510,9 @@ pub fn completions(
     offset: u32,
 ) ![]const Completion {
     for (ast.errors) |err| {
-        if (err.tag != .token or offset != err.main_location.start) continue;
+        if (err.tag != .token or
+            offset < err.main_location.start or
+            offset > err.main_location.end) continue;
 
         var idx = offset;
         while (idx > 0) {
@@ -1388,7 +1524,7 @@ pub fn completions(
             }
         } else return &.{};
 
-        log.debug("completions before check", .{});
+        cpllog.debug("completions before check", .{});
         const parent_idx = err.node_idx;
         const parent_node = ast.nodes[parent_idx];
         if ((!parent_node.kind.isElement() and
@@ -1396,19 +1532,19 @@ pub fn completions(
             parent_node.kind == .svg or
             parent_node.kind == .math) return &.{};
 
-        log.debug("completions past check", .{});
+        cpllog.debug("completions past check", .{});
 
         const e = Element.all.get(parent_node.kind);
-        log.debug("===== completions content: {t}", .{parent_node.kind});
+        cpllog.debug("===== completions content: {t}", .{parent_node.kind});
         return e.completions(arena, ast, src, parent_idx, offset, .content);
     }
 
     const node_idx = ast.findNodeTagsIdx(offset);
-    log.debug("===== completions: attrs node: {}", .{node_idx});
+    cpllog.debug("===== completions: attrs node: {}", .{node_idx});
     if (node_idx == 0) return &.{};
 
     const n = ast.nodes[node_idx];
-    log.debug("===== node: {any}", .{n});
+    cpllog.debug("===== node: {any}", .{n});
     if (!n.kind.isElement()) return &.{};
     if (offset >= n.open.end) return &.{};
 
@@ -1457,6 +1593,8 @@ pub fn findNodeTagsIdx(ast: *const Ast, offset: u32) u32 {
     var cur_idx: u32 = 1;
     while (cur_idx != 0) {
         const n = ast.nodes[cur_idx];
+        if (!n.kind.isElement()) cur_idx = 0;
+
         if (n.open.start <= offset and n.open.end > offset) {
             break;
         }
@@ -1606,7 +1744,7 @@ fn debugNodes(nodes: []const Node, src: []const u8) void {
 test "basics" {
     const case = "<html><head></head><body><div><br></div></body></html>\n";
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -1617,7 +1755,7 @@ test "basics - attributes" {
         \\<div id="foo" class="bar">
     ++ "<link></div></body></html>\n";
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -1644,10 +1782,29 @@ test "newlines" {
         \\</html>
         \\
     , .{'\t'});
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
+}
+
+test "tight tags inner indentation" {
+    const case = comptime std.fmt.comptimePrint(
+        \\<!DOCTYPE html>
+        \\<html>
+        \\{0c}<head></head>
+        \\{0c}<body>
+        \\{0c}{0c}<div><nav><ul>
+        \\{0c}{0c}{0c}<li></li>
+        \\{0c}{0c}</ul></nav></div>
+        \\{0c}</body>
+        \\</html>
+        \\
+    , .{'\t'});
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "bad html" {
@@ -1661,7 +1818,7 @@ test "bad html" {
         \\
         \\</html>
     ;
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
@@ -1683,7 +1840,7 @@ test "formatting - simple" {
         \\</html>
         \\
     , .{'\t'});
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1715,7 +1872,7 @@ test "formatting - attributes" {
         \\</html>
         \\
     , .{'\t'});
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1733,7 +1890,7 @@ test "pre" {
         \\
     ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1752,7 +1909,7 @@ test "pre text" {
         \\
     , .{'\t'});
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1790,7 +1947,7 @@ test "what" {
         \\
     , .{'\t'});
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1827,7 +1984,7 @@ test "spans" {
         \\
     , .{'\t'});
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1835,17 +1992,13 @@ test "spans" {
 test "arrow span" {
     const case =
         \\<a href="$if.permalink()">← <span var="$if.title"></span></a>
-    ;
-    const expected = comptime std.fmt.comptimePrint(
-        \\<a href="$if.permalink()">←
-        \\{c}<span var="$if.title"></span></a>
         \\
-    , .{'\t'});
+    ;
 
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
-    try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 test "self-closing tag complex example" {
@@ -1868,7 +2021,7 @@ test "self-closing tag complex example" {
         \\</div>
         \\
     , .{'\t'});
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
@@ -1921,10 +2074,32 @@ test "respect empty lines" {
         \\</div>
         \\
     , .{'\t'});
-    const ast = try Ast.init(std.testing.allocator, case, .html, true);
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
     defer ast.deinit(std.testing.allocator);
 
     try std.testing.expectFmt(expected, "{f}", .{ast.formatter(case)});
+}
+
+test "pre formatting" {
+    const case = comptime std.fmt.comptimePrint(
+        \\<!DOCTYPE html>
+        \\<html>
+        \\{0c}<head>
+        \\{0c}{0c}<title>Test</title>
+        \\{0c}</head>
+        \\{0c}<body>
+        \\{0c}{0c}<pre>Line 1
+        \\Line 2
+        \\Line 3
+        \\</pre>
+        \\{0c}</body>
+        \\</html>
+        \\
+    , .{'\t'});
+
+    const ast = try Ast.init(std.testing.allocator, case, .html, false);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectFmt(case, "{f}", .{ast.formatter(case)});
 }
 
 pub const Cursor = struct {
@@ -1974,3 +2149,47 @@ pub const Cursor = struct {
         };
     }
 };
+
+test "fuzz" {
+    const Reader = std.Io.Reader;
+    const generator = @import("../generator/html.zig");
+    const Context = struct {
+        arena: *std.heap.ArenaAllocator,
+        out: *Writer,
+        fn testOne(ctx: @This(), input: []const u8) anyerror!void {
+            _ = ctx.arena.reset(.retain_capacity);
+            const gpa = ctx.arena.allocator();
+
+            var in: Reader = .fixed(input);
+            var out: Writer.Allocating = .init(gpa);
+            generator.generate(gpa, &in, &out.writer) catch |err| {
+                if (err == error.Skip) return;
+                return err;
+            };
+
+            if (builtin.fuzz) {
+                std.debug.print("--begin--\n{s}\n\n", .{out.written()});
+            }
+
+            const ast: Ast = try .init(gpa, out.written(), .html, false);
+
+            var bufnull: [4096]u8 = undefined;
+            var devnull: Writer.Discarding = .init(&bufnull);
+            if (!ast.has_syntax_errors) {
+                try ast.render(out.written(), &devnull.writer);
+            }
+
+            if (ast.errors.len > 0) {
+                try ast.printErrors(out.written(), null, &devnull.writer);
+            }
+        }
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    var buf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&buf);
+    try std.testing.fuzz(Context{
+        .arena = &arena,
+        .out = &out.interface,
+    }, Context.testOne, .{});
+}

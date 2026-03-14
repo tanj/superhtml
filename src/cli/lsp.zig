@@ -9,12 +9,13 @@ const super = @import("superhtml");
 const Document = @import("lsp/Document.zig");
 const logic = @import("lsp/logic.zig");
 
-const log = std.log.scoped(.super_lsp);
+const log = std.log.scoped(.superhtml_lsp);
 
-pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
-    _ = args;
+pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !noreturn {
+    log.debug("SuperHTML Langauge Server Started!", .{});
+    for (args) |arg| log.debug("arg: {s}", .{arg});
 
-    log.debug("SuperHTML LSP started!", .{});
+    const cmd = Command.parse(args);
 
     var buf: [4096]u8 = undefined;
     var stdio: lsp.Transport.Stdio = .init(
@@ -26,7 +27,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var handler: Handler = .{
         .gpa = gpa,
         .transport = &stdio.transport,
-        .strict = true,
+        .syntax_only = cmd.syntax_only,
     };
     defer handler.deinit();
 
@@ -36,6 +37,8 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
         &handler,
         log.err,
     );
+
+    std.process.exit(0);
 }
 
 pub const Handler = @This();
@@ -44,7 +47,7 @@ gpa: std.mem.Allocator,
 transport: *lsp.Transport,
 files: std.StringHashMapUnmanaged(Document) = .{},
 offset_encoding: offsets.Encoding = .@"utf-16",
-strict: bool,
+syntax_only: bool,
 
 fn deinit(self: *Handler) void {
     var file_it = self.files.valueIterator();
@@ -125,7 +128,7 @@ pub fn initialize(
             .triggerCharacters = &.{
                 "<",  "/", " ",
                 "\n", "'", "\"",
-                "=",  ",",
+                "=",  ",", "-",
             },
         },
 
@@ -274,7 +277,7 @@ pub fn @"textDocument/codeAction"(
         self.offset_encoding,
     );
 
-    if (!self.strict) return null;
+    if (self.syntax_only) return null;
 
     for (doc.html.errors) |err| {
         if (err.tag != .invalid_html_tag_name) continue;
@@ -349,6 +352,8 @@ pub fn @"textDocument/prepareRename"(
     if (node_idx == 0) return null;
 
     const node = doc.html.nodes[node_idx];
+    if (!node.kind.isElement()) return null;
+
     const it = node.startTagIterator(doc.src, doc.language);
 
     const range = lsp.offsets.locToRange(doc.src, .{
@@ -519,9 +524,23 @@ pub fn @"textDocument/completion"(
     const completions = try doc.html.completions(arena, doc.src, @intCast(offset));
     const items = try arena.alloc(lsp.types.CompletionItem, completions.len);
     for (items, completions) |*it, cpl| {
+        log.debug("label = '{s}' desc = '{s}'", .{ cpl.label, cpl.desc });
+        const insert_text = if (cpl.value) |v| blk: {
+            if (cpl.kind != .element_open) break :blk v;
+            var idx = offset;
+            const has_closing_bracket = while (idx < doc.src.len) : (idx += 1) {
+                switch (doc.src[idx]) {
+                    else => {},
+                    '\n' => break false,
+                    '>' => break true,
+                }
+            } else false;
+            if (has_closing_bracket) break :blk v[0..cpl.label.len];
+            break :blk v;
+        } else null;
         it.* = .{
             .label = cpl.label,
-            .insertText = cpl.value,
+            .insertText = insert_text,
             .documentation = if (cpl.desc.len == 0) null else .{
                 .MarkupContent = .{
                     .kind = .markdown,
@@ -529,6 +548,8 @@ pub fn @"textDocument/completion"(
                 },
             },
             .commitCharacters = &.{" >"},
+            .preselect = cpl.label[0] == '/',
+            .insertTextFormat = if (cpl.kind == .element_open) .Snippet else null,
         };
     }
 
@@ -582,6 +603,7 @@ pub fn findNode(doc: *const Document, offset: u32) u32 {
     var cur_idx: u32 = 1;
     while (cur_idx != 0) {
         const n = doc.html.nodes[cur_idx];
+        if (!n.kind.isElement()) cur_idx = 0;
         if (n.open.start <= offset and n.open.end > offset) {
             break;
         }
@@ -599,7 +621,6 @@ pub fn findNode(doc: *const Document, offset: u32) u32 {
     return cur_idx;
 }
 
-// TODO this should not allocate
 pub fn tagRanges(
     self: *Handler,
     arena: std.mem.Allocator,
@@ -625,6 +646,8 @@ pub fn tagRanges(
             if (err.node_idx != 0) break err.node_idx;
         }
     } else findNode(doc, @intCast(offset));
+
+    if (node_idx == 0) return &.{};
 
     const node = doc.html.nodes[node_idx];
 
@@ -652,4 +675,28 @@ pub fn tagRanges(
         .end = close.end - 1,
     }, doc.src);
     return ranges;
+}
+
+const Command = struct {
+    syntax_only: bool = false,
+
+    fn parse(args: []const []const u8) Command {
+        if (args.len == 0) return .{};
+        if (args.len > 1) fatalHelp();
+        if (std.mem.eql(u8, args[0], "--syntax-only")) {
+            return .{ .syntax_only = true };
+        } else fatalHelp();
+    }
+};
+
+fn fatalHelp() noreturn {
+    const msg =
+        \\Usage: superhtml lsp [--syntax-only]
+        \\
+        \\The --syntax-only flag disables HTML element and attribute validation. 
+    ;
+
+    std.debug.print(msg, .{});
+    log.err(msg, .{});
+    std.process.exit(1);
 }
